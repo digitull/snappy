@@ -1,41 +1,174 @@
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
-import { type CallToolResult, type GetPromptResult, type ReadResourceResult } from "@modelcontextprotocol/sdk/types.js";
+import type { CallToolResult } from "@modelcontextprotocol/sdk/types.js";
+
+// Base URL of your Snaptask Adaptive app
+const SNAPTASK_BASE_URL =
+  process.env.SNAPTASK_BASE_URL ?? "https://ma64ers93d.adaptive.ai";
+
+// Helper for calling Snaptask RPCs
+async function callSnaptaskRpc<T>(
+  rpcName: string,
+  params: unknown = {},
+): Promise<T> {
+  const url = new URL(`/api/rpc/${rpcName}`, SNAPTASK_BASE_URL);
+
+  const res = await fetch(url.toString(), {
+    method: "POST",
+    headers: {
+      "content-type": "application/json",
+      // If you later add auth to the app, add headers here, e.g.:
+      // Authorization: `Bearer ${process.env.SNAPTASK_API_KEY}`,
+    },
+    body: JSON.stringify({ params: [params] }),
+  });
+
+  if (!res.ok) {
+    const text = await res.text().catch(() => "");
+    throw new Error(
+      `Snaptask RPC ${rpcName} failed: ${res.status} ${res.statusText} ${text}`,
+    );
+  }
+
+  return (await res.json()) as T;
+}
 
 export const getServer = (): McpServer => {
   const server = new McpServer(
     {
-      name: "mcp-server-template",
-      version: "0.0.1",
+      name: "snaptask-mcp-server",
+      version: "0.1.0",
     },
     { capabilities: {} },
   );
 
-  // Register a simple prompt
-  server.prompt(
-    "greeting-template",
-    "A simple greeting prompt template",
-    {
-      name: z.string().describe("Name to include in greeting"),
-    },
-    async ({ name }): Promise<GetPromptResult> => {
+  // List today's tasks
+  server.tool(
+    "list_today_tasks",
+    "List today's tasks from Snaptask for the current user",
+    {},
+    async (): Promise<CallToolResult> => {
+      const tasks = await callSnaptaskRpc<unknown[]>("mcpListTodayTasks");
+
       return {
-        messages: [
+        content: [
           {
-            role: "user",
-            content: {
-              type: "text",
-              text: `Please greet ${name} in a friendly manner.`,
-            },
+            type: "text",
+            text: JSON.stringify(tasks, null, 2),
           },
         ],
       };
     },
   );
 
+  // Week overview
+  server.tool(
+    "list_week_overview",
+    "Get a high-level overview of this week's tasks from Snaptask",
+    {},
+    async (): Promise<CallToolResult> => {
+      const overview = await callSnaptaskRpc<unknown>("mcpListWeekOverview");
+
+      return {
+        content: [
+          {
+            type: "text",
+            text: JSON.stringify(overview, null, 2),
+          },
+        ],
+      };
+    },
+  );
+
+  // Create tasks from natural language
+  server.tool(
+    "create_tasks_from_text",
+    "Create one or more Snaptask tasks from a natural-language description",
+    {
+      text: z
+        .string()
+        .describe(
+          "Natural language description of what needs to be done (can contain multiple tasks).",
+        ),
+    },
+    async ({ text }): Promise<CallToolResult> => {
+      const created = await callSnaptaskRpc<unknown>("mcpCreateTasksFromText", {
+        text,
+      });
+
+      return {
+        content: [
+          {
+            type: "text",
+            text: JSON.stringify(created, null, 2),
+          },
+        ],
+      };
+    },
+  );
+
+  // Update task status
+  server.tool(
+    "update_task_status",
+    "Update the status of a Snaptask task",
+    {
+      taskId: z.string().describe("The Snaptask task ID to update"),
+      status: z
+        .enum(["TODO", "IN_PROGRESS", "DONE", "BLOCKED"])
+        .describe("The new status for the task"),
+    },
+    async ({ taskId, status }): Promise<CallToolResult> => {
+      const result = await callSnaptaskRpc<unknown>("mcpUpdateTaskStatus", {
+        taskId,
+        status,
+      });
+
+      return {
+        content: [
+          {
+            type: "text",
+            text: JSON.stringify(result, null, 2),
+          },
+        ],
+      };
+    },
+  );
+
+  // Suggest next tasks
+  server.tool(
+    "suggest_next_tasks",
+    "Ask Snaptask to suggest the best next tasks to work on",
+    {
+      limit: z
+        .number()
+        .int()
+        .min(1)
+        .max(20)
+        .optional()
+        .default(5)
+        .describe("Maximum number of suggested tasks to return"),
+    },
+    async ({ limit }): Promise<CallToolResult> => {
+      const suggestions = await callSnaptaskRpc<unknown[]>(
+        "mcpSuggestNextTasks",
+        { limit },
+      );
+
+      return {
+        content: [
+          {
+            type: "text",
+            text: JSON.stringify(suggestions, null, 2),
+          },
+        ],
+      };
+    },
+  );
+
+  // Simple sanity-check tool
   server.tool(
     "greet",
-    "A simple greeting tool",
+    "Simple greeting tool to verify the MCP server is working",
     {
       name: z.string().describe("Name to greet"),
     },
@@ -44,23 +177,7 @@ export const getServer = (): McpServer => {
         content: [
           {
             type: "text",
-            text: `Hello, ${name}!`,
-          },
-        ],
-      };
-    },
-  );
-
-  server.resource(
-    "greeting-resource",
-    "https://example.com/greetings/default",
-    { mimeType: "text/plain" },
-    async (): Promise<ReadResourceResult> => {
-      return {
-        contents: [
-          {
-            uri: "https://example.com/greetings/default",
-            text: "Hello, world!",
+            text: `Hello, ${name}! The Snaptask MCP server is running.`,
           },
         ],
       };

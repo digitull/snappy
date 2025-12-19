@@ -6,21 +6,36 @@ import type { CallToolResult } from "@modelcontextprotocol/sdk/types.js";
 const SNAPTASK_BASE_URL =
   process.env.SNAPTASK_BASE_URL ?? "https://ma64ers93d.adaptive.ai";
 
+// Personal API token for SnapTask (per MCP server/user environment)
+const SNAPTASK_API_TOKEN = process.env.SNAPTASK_API_TOKEN;
+
 // Helper for calling Snaptask RPCs
 async function callSnaptaskRpc<T>(
   rpcName: string,
   params: unknown = {},
 ): Promise<T> {
+  if (!SNAPTASK_API_TOKEN) {
+    throw new Error(
+      "Missing SNAPTASK_API_TOKEN. Set it in your environment so MCP calls can authenticate to SnapTask.",
+    );
+  }
+
   const url = new URL(`/api/rpc/${rpcName}`, SNAPTASK_BASE_URL);
+
+  const baseParams =
+    params && typeof params === "object" && !Array.isArray(params) ? params : {};
+
+  const paramsWithToken = {
+    ...(baseParams as Record<string, unknown>),
+    apiToken: SNAPTASK_API_TOKEN,
+  };
 
   const res = await fetch(url.toString(), {
     method: "POST",
     headers: {
       "content-type": "application/json",
-      // If you later add auth to the app, add headers here, e.g.:
-      // Authorization: `Bearer ${process.env.SNAPTASK_API_KEY}`,
     },
-    body: JSON.stringify({ params: [params] }),
+    body: JSON.stringify({ params: [paramsWithToken] }),
   });
 
   if (!res.ok) {

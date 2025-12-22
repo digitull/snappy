@@ -1,826 +1,906 @@
 import express from "express";
 import crypto from "crypto";
+import path from "path";
 import Database from "better-sqlite3";
-import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
-import { z } from "zod";
-import type { CallToolResult } from "@modelcontextprotocol/sdk/types.js";
 
-// =========================
-// Config
-// =========================
+const app = express();
 
-const BASE_URL = (process.env.PUBLIC_BASE_URL ?? "https://snappy-91c33835.alpic.live").replace(
-  /\/$/,
-  "",
-);
+// ChatGPT often sends JSON
+app.use(express.json({ limit: "2mb" }));
+app.use(express.urlencoded({ extended: true }));
 
-// Your Snaptask Adaptive app RPC base
-const SNAPTASK_BASE_URL = (process.env.SNAPTASK_BASE_URL ?? "https://ma64ers93d.adaptive.ai").replace(
-  /\/$/,
-  "",
-);
+/**
+ * === REQUIRED ENV ===
+ * PUBLIC_BASE_URL   e.g. https://snappy-8615fb5a.alpic.live
+ * SERVER_SECRET     long random string (REQUIRED in production)
+ *
+ * === OPTIONAL ENV ===
+ * OAUTH_DB_PATH     default ./oauth.sqlite
+ * APP_NAME          default "Snappy MCP"
+ * ALLOWED_REDIRECT_URI_PREFIXES comma-separated prefixes allowed (defaults include chatgpt.com + chat.openai.com)
+ */
 
-// Optional operator default (not recommended for production, but helpful for testing)
-const DEFAULT_SNAPTASK_API_TOKEN = process.env.SNAPTASK_API_TOKEN?.trim() || undefined;
+const BASE_URL = (process.env.PUBLIC_BASE_URL ?? "https://snappy-8615fb5a.alpic.live").replace(/\/$/, "");
+const APP_NAME = process.env.APP_NAME ?? "Snappy MCP";
+const DB_PATH = process.env.OAUTH_DB_PATH ?? path.join(process.cwd(), "oauth.sqlite");
 
-// Used to sign auth codes (anti-tamper) + cookies. MUST be set in prod.
-const SERVER_SECRET = process.env.SERVER_SECRET || "dev-secret-change-me";
+const ALLOWED_REDIRECT_URI_PREFIXES = (process.env.ALLOWED_REDIRECT_URI_PREFIXES ??
+  "https://chat.openai.com/,https://chatgpt.com/")
+  .split(",")
+  .map((s) => s.trim())
+  .filter(Boolean);
 
-// Port
-const PORT = Number(process.env.PORT ?? 3000);
+const SERVER_SECRET = process.env.SERVER_SECRET ?? "";
+if (!SERVER_SECRET || SERVER_SECRET.length < 32) {
+  // This is a security requirement. If you want to allow local dev without it, set NODE_ENV != production.
+  if (process.env.NODE_ENV === "production") {
+    throw new Error("SERVER_SECRET must be set to a long random string in production.");
+  }
+}
 
-// =========================
-// DB (SQLite) - persistent storage
-// =========================
-
-const db = new Database(process.env.OAUTH_DB_PATH ?? "./oauth.sqlite");
+const db = new Database(DB_PATH);
 db.pragma("journal_mode = WAL");
 
 db.exec(`
-CREATE TABLE IF NOT EXISTS oauth_clients (
-  client_id TEXT PRIMARY KEY,
-  redirect_uris TEXT NOT NULL,
-  created_at INTEGER NOT NULL
-);
+  CREATE TABLE IF NOT EXISTS users (
+    id TEXT PRIMARY KEY,
+    createdAt INTEGER NOT NULL
+  );
 
-CREATE TABLE IF NOT EXISTS connected_accounts (
-  id TEXT PRIMARY KEY,
-  snaptask_token TEXT NOT NULL,
-  manage_token TEXT NOT NULL,
-  revoked_at INTEGER
-);
+  CREATE TABLE IF NOT EXISTS user_secrets (
+    userId TEXT PRIMARY KEY,
+    githubTokenEnc TEXT NOT NULL,
+    updatedAt INTEGER NOT NULL,
+    FOREIGN KEY(userId) REFERENCES users(id) ON DELETE CASCADE
+  );
 
-CREATE TABLE IF NOT EXISTS auth_codes (
-  code TEXT PRIMARY KEY,
-  client_id TEXT NOT NULL,
-  redirect_uri TEXT NOT NULL,
-  code_challenge TEXT NOT NULL,
-  code_challenge_method TEXT NOT NULL,
-  scope TEXT NOT NULL,
-  account_id TEXT NOT NULL,
-  expires_at INTEGER NOT NULL
-);
+  CREATE TABLE IF NOT EXISTS oauth_clients (
+    clientId TEXT PRIMARY KEY,
+    redirectUrisJson TEXT NOT NULL,
+    createdAt INTEGER NOT NULL,
+    updatedAt INTEGER NOT NULL
+  );
 
-CREATE TABLE IF NOT EXISTS oauth_tokens (
-  access_token TEXT PRIMARY KEY,
-  refresh_token_hash TEXT NOT NULL,
-  account_id TEXT NOT NULL,
-  scope TEXT NOT NULL,
-  access_expires_at INTEGER NOT NULL,
-  revoked_at INTEGER,
-  created_at INTEGER NOT NULL,
-  last_used_at INTEGER
-);
+  CREATE TABLE IF NOT EXISTS oauth_codes (
+    code TEXT PRIMARY KEY,
+    clientId TEXT NOT NULL,
+    userId TEXT NOT NULL,
+    redirectUri TEXT NOT NULL,
+    scope TEXT NOT NULL,
+    codeChallenge TEXT NOT NULL,
+    codeChallengeMethod TEXT NOT NULL,
+    expiresAt INTEGER NOT NULL
+  );
 
-CREATE INDEX IF NOT EXISTS idx_tokens_refresh_hash ON oauth_tokens(refresh_token_hash);
+  CREATE TABLE IF NOT EXISTS oauth_tokens (
+    accessTokenHash TEXT PRIMARY KEY,
+    refreshTokenHash TEXT NOT NULL,
+    clientId TEXT NOT NULL,
+    userId TEXT NOT NULL,
+    scope TEXT NOT NULL,
+    accessExpiresAt INTEGER NOT NULL,
+    refreshExpiresAt INTEGER NOT NULL,
+    createdAt INTEGER NOT NULL
+  );
+
+  CREATE INDEX IF NOT EXISTS oauth_tokens_refresh_idx ON oauth_tokens(refreshTokenHash);
 `);
-
-// =========================
-// Small helpers
-// =========================
 
 function nowMs() {
   return Date.now();
 }
 
-function randomToken(bytes = 32) {
-  return crypto.randomBytes(bytes).toString("base64url");
+function base64Url(buf: Buffer) {
+  return buf
+    .toString("base64")
+    .replace(/\+/g, "-")
+    .replace(/\//g, "_")
+    .replace(/=+$/g, "");
 }
 
 function sha256Base64Url(input: string) {
-  return crypto.createHash("sha256").update(input).digest("base64url");
+  const h = crypto.createHash("sha256").update(input).digest();
+  return base64Url(h);
 }
 
-function constantTimeEqual(a: string, b: string) {
-  const ab = Buffer.from(a);
-  const bb = Buffer.from(b);
-  if (ab.length !== bb.length) return false;
-  return crypto.timingSafeEqual(ab, bb);
+function randomToken(bytes = 32) {
+  return base64Url(crypto.randomBytes(bytes));
 }
 
-function parseAuthHeader(headerValue?: string) {
-  if (!headerValue) return undefined;
-  const m = headerValue.match(/^Bearer\s+(.+)$/i);
-  return m?.[1]?.trim();
-}
-
-function getHeader(req: any, key: string) {
-  const k = key.toLowerCase();
-  const v = req.headers?.[k];
-  if (Array.isArray(v)) return v[0];
-  return v ? String(v) : undefined;
-}
-
-function setNoStore(res: any) {
-  res.setHeader("Cache-Control", "no-store");
-  res.setHeader("Pragma", "no-cache");
-}
-
-function getCookie(req: any, name: string): string | undefined {
-  const raw = req.headers?.cookie;
-  if (!raw) return undefined;
-  const parts = raw.split(";").map((p: string) => p.trim());
-  for (const p of parts) {
-    const [k, ...rest] = p.split("=");
-    if (k === name) return decodeURIComponent(rest.join("="));
+function safeJsonParse<T>(s: string, fallback: T): T {
+  try {
+    return JSON.parse(s) as T;
+  } catch {
+    return fallback;
   }
-  return undefined;
+}
+
+function isAllowedRedirectUri(redirectUri: string) {
+  return ALLOWED_REDIRECT_URI_PREFIXES.some((prefix) => redirectUri.startsWith(prefix));
+}
+
+function deriveKey() {
+  // 32-byte key for AES-256-GCM
+  return crypto.createHash("sha256").update(SERVER_SECRET || "dev-secret").digest();
+}
+
+function encryptString(plain: string) {
+  const key = deriveKey();
+  const iv = crypto.randomBytes(12);
+  const cipher = crypto.createCipheriv("aes-256-gcm", key, iv);
+  const ciphertext = Buffer.concat([cipher.update(Buffer.from(plain, "utf8")), cipher.final()]);
+  const tag = cipher.getAuthTag();
+  // iv.tag.ciphertext (base64url)
+  return `${base64Url(iv)}.${base64Url(tag)}.${base64Url(ciphertext)}`;
+}
+
+function decryptString(enc: string) {
+  const key = deriveKey();
+  const [ivB64, tagB64, ctB64] = enc.split(".");
+  if (!ivB64 || !tagB64 || !ctB64) throw new Error("Invalid encrypted payload");
+  const iv = Buffer.from(ivB64.replace(/-/g, "+").replace(/_/g, "/"), "base64");
+  const tag = Buffer.from(tagB64.replace(/-/g, "+").replace(/_/g, "/"), "base64");
+  const ct = Buffer.from(ctB64.replace(/-/g, "+").replace(/_/g, "/"), "base64");
+  const decipher = crypto.createDecipheriv("aes-256-gcm", key, iv);
+  decipher.setAuthTag(tag);
+  const plain = Buffer.concat([decipher.update(ct), decipher.final()]);
+  return plain.toString("utf8");
+}
+
+/**
+ * Minimal signed cookie session (no external deps).
+ */
+function signCookie(payload: object) {
+  const json = JSON.stringify(payload);
+  const mac = crypto.createHmac("sha256", SERVER_SECRET || "dev-secret").update(json).digest("base64url");
+  return `${base64Url(Buffer.from(json, "utf8"))}.${mac}`;
+}
+function verifyCookie<T>(cookie: string): T | null {
+  const [payloadB64, mac] = cookie.split(".");
+  if (!payloadB64 || !mac) return null;
+  const json = Buffer.from(payloadB64.replace(/-/g, "+").replace(/_/g, "/"), "base64").toString("utf8");
+  const expected = crypto.createHmac("sha256", SERVER_SECRET || "dev-secret").update(json).digest("base64url");
+  if (!crypto.timingSafeEqual(Buffer.from(mac), Buffer.from(expected))) return null;
+  return safeJsonParse<T>(json, null as any);
+}
+
+function getCookie(req: any, name: string) {
+  const raw = req.headers.cookie as string | undefined;
+  if (!raw) return null;
+  const parts = raw.split(";").map((p) => p.trim());
+  for (const p of parts) {
+    const idx = p.indexOf("=");
+    if (idx === -1) continue;
+    const k = p.slice(0, idx);
+    const v = p.slice(idx + 1);
+    if (k === name) return decodeURIComponent(v);
+  }
+  return null;
 }
 
 function setCookie(res: any, name: string, value: string) {
-  // HttpOnly for manage token cookie. SameSite=Lax is fine for oauth authorize page.
-  res.setHeader(
-    "Set-Cookie",
-    `${name}=${encodeURIComponent(value)}; Path=/; HttpOnly; SameSite=Lax; Secure`,
-  );
+  // Lax works well for OAuth redirects
+  res.setHeader("Set-Cookie", `${name}=${encodeURIComponent(value)}; Path=/; HttpOnly; SameSite=Lax; Secure`);
 }
 
 function clearCookie(res: any, name: string) {
   res.setHeader(
     "Set-Cookie",
-    `${name}=; Path=/; Expires=Thu, 01 Jan 1970 00:00:00 GMT; HttpOnly; SameSite=Lax; Secure`,
+    `${name}=; Path=/; HttpOnly; SameSite=Lax; Secure; Expires=Thu, 01 Jan 1970 00:00:00 GMT`,
   );
 }
 
-// =========================
-// SnapTask RPC caller
-// =========================
-
-async function callSnaptaskRpc<T>(rpcName: string, params: Record<string, unknown>, snaptaskApiToken: string) {
-  const url = new URL(`/api/rpc/${rpcName}`, SNAPTASK_BASE_URL);
-
-  const res = await fetch(url.toString(), {
-    method: "POST",
-    headers: { "content-type": "application/json" },
-    body: JSON.stringify({ params: [{ ...params, apiToken: snaptaskApiToken }] }),
-  });
-
-  if (!res.ok) {
-    const text = await res.text().catch(() => "");
-    throw new Error(`Snaptask RPC ${rpcName} failed: ${res.status} ${res.statusText} ${text}`);
+function ensureUser(userId: string) {
+  const existing = db.prepare("SELECT id FROM users WHERE id = ?").get(userId);
+  if (!existing) {
+    db.prepare("INSERT INTO users (id, createdAt) VALUES (?, ?)").run(userId, nowMs());
   }
-
-  return (await res.json()) as T;
 }
 
-// =========================
-// OAuth: lookups + issuance
-// =========================
-
-function getAccountByManageToken(manageToken: string) {
-  return db
-    .prepare(`SELECT id, snaptask_token, revoked_at FROM connected_accounts WHERE manage_token = ?`)
-    .get(manageToken) as { id: string; snaptask_token: string; revoked_at: number | null } | undefined;
+function getSessionUserId(req: any): string | null {
+  const c = getCookie(req, "mcp_session");
+  if (!c) return null;
+  const payload = verifyCookie<{ userId: string }>(c);
+  return payload?.userId ?? null;
 }
 
-function getAccountById(id: string) {
-  return db
-    .prepare(`SELECT id, snaptask_token, revoked_at FROM connected_accounts WHERE id = ?`)
-    .get(id) as { id: string; snaptask_token: string; revoked_at: number | null } | undefined;
-}
-
-function revokeAccount(accountId: string) {
-  db.prepare(`UPDATE connected_accounts SET revoked_at = ? WHERE id = ?`).run(nowMs(), accountId);
-  db.prepare(`UPDATE oauth_tokens SET revoked_at = ? WHERE account_id = ?`).run(nowMs(), accountId);
-}
-
-function upsertSingleAccount(snaptaskToken: string) {
-  // One account total per "ChatGPT user" is normally keyed by the OAuth client + refresh token set.
-  // Since you chose "exactly one", we interpret it as: one active account per manage-token/browser session,
-  // and when reconnecting, we overwrite that account and revoke previous tokens.
-
-  // Create a brand new account each time; tokens get revoked via manage-token if user disconnects.
-  const accountId = randomToken(18);
-  const manageToken = randomToken(24);
-
-  db.prepare(
-    `INSERT INTO connected_accounts (id, snaptask_token, manage_token, revoked_at) VALUES (?, ?, ?, NULL)`,
-  ).run(accountId, snaptaskToken, manageToken);
-
-  return { accountId, manageToken };
-}
-
-function createAuthCode(input: {
-  clientId: string;
-  redirectUri: string;
-  codeChallenge: string;
-  codeChallengeMethod: string;
-  scope: string;
-  accountId: string;
-}) {
-  const code = randomToken(32);
-  const expiresAt = nowMs() + 5 * 60 * 1000; // 5 minutes
-
-  db.prepare(
-    `INSERT INTO auth_codes
-     (code, client_id, redirect_uri, code_challenge, code_challenge_method, scope, account_id, expires_at)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
-  ).run(
-    code,
-    input.clientId,
-    input.redirectUri,
-    input.codeChallenge,
-    input.codeChallengeMethod,
-    input.scope,
-    input.accountId,
-    expiresAt,
-  );
-
-  return code;
-}
-
-function exchangeAuthCode(input: {
-  code: string;
-  clientId: string;
-  redirectUri: string;
-  codeVerifier: string;
-}) {
-  const row = db.prepare(`SELECT * FROM auth_codes WHERE code = ?`).get(input.code) as
-    | {
-        code: string;
-        client_id: string;
-        redirect_uri: string;
-        code_challenge: string;
-        code_challenge_method: string;
-        scope: string;
-        account_id: string;
-        expires_at: number;
-      }
+function requireConnectedUser(req: any) {
+  const userId = getSessionUserId(req);
+  if (!userId) return null;
+  ensureUser(userId);
+  const secret = db.prepare("SELECT githubTokenEnc FROM user_secrets WHERE userId = ?").get(userId) as
+    | { githubTokenEnc: string }
     | undefined;
-
-  if (!row) throw new Error("Invalid authorization code");
-  if (row.client_id !== input.clientId) throw new Error("Client mismatch");
-  if (row.redirect_uri !== input.redirectUri) throw new Error("Redirect URI mismatch");
-  if (row.expires_at < nowMs()) throw new Error("Authorization code expired");
-  if (row.code_challenge_method !== "S256") throw new Error("Unsupported code_challenge_method");
-
-  const expected = row.code_challenge;
-  const actual = sha256Base64Url(input.codeVerifier);
-  if (!constantTimeEqual(expected, actual)) throw new Error("PKCE verification failed");
-
-  // consume code
-  db.prepare(`DELETE FROM auth_codes WHERE code = ?`).run(input.code);
-
-  // issue tokens
-  const accessToken = randomToken(32);
-  const refreshToken = randomToken(48);
-  const refreshHash = sha256Base64Url(refreshToken);
-
-  const accessExpiresAt = nowMs() + 15 * 60 * 1000; // 15 min
-
-  db.prepare(
-    `INSERT INTO oauth_tokens
-     (access_token, refresh_token_hash, account_id, scope, access_expires_at, revoked_at, created_at, last_used_at)
-     VALUES (?, ?, ?, ?, ?, NULL, ?, ?)`,
-  ).run(accessToken, refreshHash, row.account_id, row.scope, accessExpiresAt, nowMs(), nowMs());
-
-  return {
-    accessToken,
-    refreshToken,
-    scope: row.scope,
-    expiresIn: Math.floor((accessExpiresAt - nowMs()) / 1000),
-  };
+  if (!secret?.githubTokenEnc) return null;
+  return { userId, githubTokenEnc: secret.githubTokenEnc };
 }
 
-function refreshAccessToken(input: { refreshToken: string; clientId: string }) {
-  const refreshHash = sha256Base64Url(input.refreshToken);
-
-  const row = db
-    .prepare(
-      `SELECT * FROM oauth_tokens
-       WHERE refresh_token_hash = ?
-       ORDER BY created_at DESC
-       LIMIT 1`,
-    )
-    .get(refreshHash) as
-    | {
-        access_token: string;
-        refresh_token_hash: string;
-        account_id: string;
-        scope: string;
-        access_expires_at: number;
-        revoked_at: number | null;
-      }
-    | undefined;
-
-  if (!row) throw new Error("Invalid refresh token");
-  if (row.revoked_at) throw new Error("Refresh token revoked");
-
-  const account = getAccountById(row.account_id);
-  if (!account || account.revoked_at) throw new Error("Account revoked");
-
-  // Rotate refresh token (recommended)
-  const newAccessToken = randomToken(32);
-  const newRefreshToken = randomToken(48);
-  const newRefreshHash = sha256Base64Url(newRefreshToken);
-  const accessExpiresAt = nowMs() + 15 * 60 * 1000;
-
-  // Revoke old token row and create a new one
-  db.prepare(`UPDATE oauth_tokens SET revoked_at = ?, last_used_at = ? WHERE access_token = ?`).run(
-    nowMs(),
-    nowMs(),
-    row.access_token,
-  );
-
-  db.prepare(
-    `INSERT INTO oauth_tokens
-     (access_token, refresh_token_hash, account_id, scope, access_expires_at, revoked_at, created_at, last_used_at)
-     VALUES (?, ?, ?, ?, ?, NULL, ?, ?)`,
-  ).run(newAccessToken, newRefreshHash, row.account_id, row.scope, accessExpiresAt, nowMs(), nowMs());
-
-  return {
-    accessToken: newAccessToken,
-    refreshToken: newRefreshToken,
-    scope: row.scope,
-    expiresIn: Math.floor((accessExpiresAt - nowMs()) / 1000),
-  };
-}
-
-function validateBearerAccessToken(accessToken: string) {
-  const row = db
-    .prepare(
-      `SELECT * FROM oauth_tokens WHERE access_token = ? LIMIT 1`,
-    )
-    .get(accessToken) as
-    | {
-        access_token: string;
-        account_id: string;
-        scope: string;
-        access_expires_at: number;
-        revoked_at: number | null;
-      }
-    | undefined;
-
-  if (!row) return null;
-  if (row.revoked_at) return null;
-  if (row.access_expires_at < nowMs()) return null;
-
-  const account = getAccountById(row.account_id);
-  if (!account || account.revoked_at) return null;
-
-  // touch
-  db.prepare(`UPDATE oauth_tokens SET last_used_at = ? WHERE access_token = ?`).run(nowMs(), accessToken);
-
-  return {
-    accountId: row.account_id,
-    scope: row.scope,
-    snaptaskToken: account.snaptask_token,
-  };
-}
-
-// =========================
-// Well-known endpoints JSON
-// =========================
-
-function oauthProtectedResourceJson() {
-  return {
+/**
+ * === Public well-known docs for ChatGPT ===
+ */
+app.get("/.well-known/oauth-protected-resource", (_req, res) => {
+  res.json({
     resource: BASE_URL,
-    authorization_servers: [BASE_URL],
-    bearer_methods_supported: ["header"],
-    resource_documentation: `${BASE_URL}/connect`,
-    scopes_supported: ["snaptask"],
-  };
-}
+    authorization_servers: [`${BASE_URL}/.well-known/oauth-authorization-server`],
+  });
+});
 
-function oauthAuthorizationServerJson() {
-  return {
+app.get("/.well-known/oauth-authorization-server", (_req, res) => {
+  res.json({
     issuer: BASE_URL,
     authorization_endpoint: `${BASE_URL}/oauth/authorize`,
     token_endpoint: `${BASE_URL}/oauth/token`,
-    registration_endpoint: `${BASE_URL}/oauth/register`,
     revocation_endpoint: `${BASE_URL}/oauth/revoke`,
-
     response_types_supported: ["code"],
     grant_types_supported: ["authorization_code", "refresh_token"],
-
-    token_endpoint_auth_methods_supported: ["none"],
-    code_challenge_methods_supported: ["S256"],
-
-    scopes_supported: ["snaptask"],
-  };
-}
-
-function wwwAuthenticateHeaderValue() {
-  return `Bearer realm="snaptask", error="invalid_token", error_description="Missing or invalid access token", resource_metadata="${BASE_URL}/.well-known/oauth-protected-resource"`;
-}
-
-// =========================
-// MCP server (tools)
-// =========================
-
-export const getServer = (): McpServer => {
-  const server = new McpServer({ name: "snaptask-mcp-server", version: "0.2.0" }, { capabilities: {} });
-
-  // All tools now require Bearer auth (validated in HTTP middleware).
-  // The snaptask token is attached to extra.requestContext.snaptaskToken by our middleware.
-
-  function requireSnaptaskToken(extra: any) {
-    const token = extra?.requestContext?.snaptaskToken as string | undefined;
-    if (token) return token;
-
-    // fallback for local/testing only
-    if (DEFAULT_SNAPTASK_API_TOKEN) return DEFAULT_SNAPTASK_API_TOKEN;
-
-    const err: any = new Error("Unauthorized");
-    err.code = "UNAUTHORIZED";
-    throw err;
-  }
-
-  server.tool(
-    "list_today_tasks",
-    "List today's tasks from Snaptask for the connected user",
-    {},
-    async (_args, extra: any): Promise<CallToolResult> => {
-      const snaptaskToken = requireSnaptaskToken(extra);
-      const tasks = await callSnaptaskRpc<unknown[]>("mcpListTodayTasks", {}, snaptaskToken);
-      return { content: [{ type: "text", text: JSON.stringify(tasks, null, 2) }] };
-    },
-  );
-
-  server.tool(
-    "list_week_overview",
-    "Get a high-level overview of this week's tasks from Snaptask",
-    {},
-    async (_args, extra: any): Promise<CallToolResult> => {
-      const snaptaskToken = requireSnaptaskToken(extra);
-      const overview = await callSnaptaskRpc<unknown>("mcpListWeekOverview", {}, snaptaskToken);
-      return { content: [{ type: "text", text: JSON.stringify(overview, null, 2) }] };
-    },
-  );
-
-  server.tool(
-    "create_tasks_from_text",
-    "Create one or more Snaptask tasks from a natural-language description",
-    {
-      text: z.string().describe("Natural language description (can contain multiple tasks)."),
-    },
-    async ({ text }, extra: any): Promise<CallToolResult> => {
-      const snaptaskToken = requireSnaptaskToken(extra);
-      const created = await callSnaptaskRpc<unknown>("mcpCreateTasksFromText", { text }, snaptaskToken);
-      return { content: [{ type: "text", text: JSON.stringify(created, null, 2) }] };
-    },
-  );
-
-  server.tool(
-    "update_task_status",
-    "Update the status of a Snaptask task",
-    {
-      taskId: z.string().describe("The Snaptask task ID to update"),
-      status: z.enum(["TODO", "IN_PROGRESS", "DONE", "BLOCKED"]).describe("The new status"),
-    },
-    async ({ taskId, status }, extra: any): Promise<CallToolResult> => {
-      const snaptaskToken = requireSnaptaskToken(extra);
-      const result = await callSnaptaskRpc<unknown>("mcpUpdateTaskStatus", { taskId, status }, snaptaskToken);
-      return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] };
-    },
-  );
-
-  server.tool(
-    "suggest_next_tasks",
-    "Ask Snaptask to suggest the best next tasks to work on",
-    {
-      limit: z.number().min(1).max(20).optional().default(5).describe("Max suggestions"),
-    },
-    async ({ limit }, extra: any): Promise<CallToolResult> => {
-      const snaptaskToken = requireSnaptaskToken(extra);
-      const suggestions = await callSnaptaskRpc<unknown[]>("mcpSuggestNextTasks", { limit }, snaptaskToken);
-      return { content: [{ type: "text", text: JSON.stringify(suggestions, null, 2) }] };
-    },
-  );
-
-  server.tool(
-    "greet",
-    "Simple greeting tool to verify the MCP server is working",
-    { name: z.string().describe("Name to greet") },
-    async ({ name }): Promise<CallToolResult> => {
-      return { content: [{ type: "text", text: `Hello, ${name}! The Snaptask MCP server is running.` }] };
-    },
-  );
-
-  return server;
-};
-
-// =========================
-// HTTP server with OAuth + MCP endpoint
-// =========================
-
-export async function start() {
-  const app = express();
-
-  // token endpoint uses urlencoded typically; others json
-  app.use(express.urlencoded({ extended: false }));
-  app.use(express.json({ limit: "1mb" }));
-
-  // --- Well-known endpoints ---
-  app.get("/.well-known/oauth-protected-resource", (_req, res) => {
-    setNoStore(res);
-    res.type("application/json").send(oauthProtectedResourceJson());
+    code_challenge_methods_supported: ["S256", "plain"],
+    token_endpoint_auth_methods_supported: ["none", "client_secret_post"],
+    scopes_supported: ["github.read", "github.write"],
   });
+});
 
-  app.get("/.well-known/oauth-authorization-server", (_req, res) => {
-    setNoStore(res);
-    res.type("application/json").send(oauthAuthorizationServerJson());
-  });
+/**
+ * === Connect screen ===
+ * User pastes a GitHub personal access token (PAT).
+ * We store it encrypted and bind it to a signed session cookie.
+ */
+app.get("/connect", (req, res) => {
+  const returnTo = (req.query.returnTo as string | undefined) ?? "/";
+  const userId = getSessionUserId(req);
+  const ok = req.query.ok === "1";
 
-  // --- Human landing page ---
-  app.get("/connect", (req, res) => {
-    const manage = getCookie(req, "snaptask_manage");
-    const has = manage ? !!getAccountByManageToken(manage) : false;
-
-    res.type("text/html").send(`
+  res.setHeader("Content-Type", "text/html; charset=utf-8");
+  res.send(`
 <!doctype html>
 <html>
-  <head><meta charset="utf-8"/><title>Connect SnapTask</title></head>
-  <body style="font-family: system-ui; max-width: 720px; margin: 40px auto;">
-    <h1>Connect SnapTask</h1>
-    <p>This server is meant to be connected from ChatGPT via “Connect”.</p>
-    <p>If ChatGPT sent you here, keep that tab open and complete the connection prompt there.</p>
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>${APP_NAME} – Connect</title>
+  <style>
+    body { font-family: system-ui, -apple-system, Segoe UI, Roboto, sans-serif; margin: 0; padding: 24px; background:#0b0b0c; color:#fff; }
+    .card { max-width: 720px; margin: 0 auto; background:#141416; border:1px solid #2a2a2f; border-radius: 14px; padding: 18px; }
+    a { color: #8ab4ff; }
+    input, textarea { width:100%; padding:12px; border-radius: 10px; border:1px solid #2a2a2f; background:#0f0f12; color:#fff; }
+    button { padding: 12px 14px; border-radius: 10px; border: 0; background: #2b6cff; color:#fff; font-weight: 600; cursor:pointer; }
+    .muted { color:#b7b7c2; font-size: 14px; line-height: 1.4; }
+    .ok { background:#0f2a16; border:1px solid #1f7a3a; padding:10px 12px; border-radius: 10px; margin-bottom: 12px; }
+    .warn { background:#2a1a0f; border:1px solid #a85a1a; padding:10px 12px; border-radius: 10px; margin-top: 12px; }
+    code { background:#0f0f12; padding: 2px 6px; border-radius: 6px; }
+  </style>
+</head>
+<body>
+  <div class="card">
+    <h2>${APP_NAME}: Connect GitHub</h2>
+    <p class="muted">
+      To let ChatGPT use your GitHub on your behalf, paste a <strong>GitHub Personal Access Token</strong> here.
+      We store it <strong>encrypted</strong> on this server and only use it when you approve access.
+    </p>
 
-    <h2>Status</h2>
-    <p>${has ? "Connected in this browser." : "Not connected in this browser."}</p>
+    ${ok ? `<div class="ok">Saved. You can go back to ChatGPT and continue connecting.</div>` : ""}
 
-    ${has ? `
-      <form method="post" action="/disconnect">
-        <button type="submit">Disconnect</button>
-      </form>
-    ` : ""}
-  </body>
-</html>`);
-  });
+    <form method="POST" action="/connect">
+      <input type="hidden" name="returnTo" value="${encodeURIComponent(returnTo)}" />
+      <label class="muted">GitHub Personal Access Token</label>
+      <input name="githubToken" placeholder="ghp_..." autocomplete="off" />
 
-  // --- Dynamic Client Registration ---
-  app.post("/oauth/register", (req, res) => {
-    setNoStore(res);
-
-    // Accept typical DCR fields; at minimum we need redirect_uris
-    const redirectUris = Array.isArray(req.body?.redirect_uris) ? req.body.redirect_uris : [];
-    if (!redirectUris.length) {
-      return res.status(400).json({ error: "invalid_client_metadata", error_description: "redirect_uris required" });
-    }
-
-    const clientId = randomToken(18);
-    db.prepare(`INSERT INTO oauth_clients (client_id, redirect_uris, created_at) VALUES (?, ?, ?)`).run(
-      clientId,
-      JSON.stringify(redirectUris),
-      nowMs(),
-    );
-
-    return res.json({
-      client_id: clientId,
-      token_endpoint_auth_method: "none",
-      grant_types: ["authorization_code", "refresh_token"],
-      response_types: ["code"],
-      redirect_uris: redirectUris,
-    });
-  });
-
-  // --- Authorization endpoint (Connect page) ---
-  app.get("/oauth/authorize", (req, res) => {
-    setNoStore(res);
-
-    const {
-      response_type,
-      client_id,
-      redirect_uri,
-      scope = "snaptask",
-      state,
-      code_challenge,
-      code_challenge_method,
-    } = req.query as Record<string, string>;
-
-    if (response_type !== "code") return res.status(400).send("Invalid response_type");
-    if (!client_id) return res.status(400).send("Missing client_id");
-    if (!redirect_uri) return res.status(400).send("Missing redirect_uri");
-    if (!state) return res.status(400).send("Missing state");
-    if (!code_challenge || code_challenge_method !== "S256") return res.status(400).send("PKCE S256 required");
-
-    const clientRow = db.prepare(`SELECT * FROM oauth_clients WHERE client_id = ?`).get(client_id) as
-      | { client_id: string; redirect_uris: string }
-      | undefined;
-
-    if (!clientRow) return res.status(400).send("Unknown client_id");
-
-    const allowed = JSON.parse(clientRow.redirect_uris) as string[];
-    if (!allowed.includes(redirect_uri)) return res.status(400).send("redirect_uri not registered");
-
-    const manage = getCookie(req, "snaptask_manage");
-    const has = manage ? !!getAccountByManageToken(manage) : false;
-
-    res.type("text/html").send(`
-<!doctype html>
-<html>
-  <head><meta charset="utf-8"/><title>Connect SnapTask</title></head>
-  <body style="font-family: system-ui; max-width: 720px; margin: 40px auto;">
-    <h1>Connect SnapTask</h1>
-    <p>Paste your SnapTask personal API token below. This will connect SnapTask to ChatGPT.</p>
-
-    <form method="post" action="/oauth/authorize">
-      <input type="hidden" name="response_type" value="${escapeHtml(response_type)}"/>
-      <input type="hidden" name="client_id" value="${escapeHtml(client_id)}"/>
-      <input type="hidden" name="redirect_uri" value="${escapeHtml(redirect_uri)}"/>
-      <input type="hidden" name="scope" value="${escapeHtml(scope)}"/>
-      <input type="hidden" name="state" value="${escapeHtml(state)}"/>
-      <input type="hidden" name="code_challenge" value="${escapeHtml(code_challenge)}"/>
-      <input type="hidden" name="code_challenge_method" value="${escapeHtml(code_challenge_method)}"/>
-
-      <label>SnapTask API token</label><br/>
-      <input name="snaptask_token" type="password" style="width: 100%; padding: 10px; font-size: 16px;" required /><br/><br/>
-      <button type="submit" style="padding: 10px 14px; font-size: 16px;">Connect</button>
+      <div style="height: 12px"></div>
+      <button type="submit">Save token</button>
     </form>
 
-    <hr style="margin: 24px 0;" />
+    <div class="warn">
+      <div class="muted">
+        Tip: Use a token with the minimal scopes you need.
+        For private repos, you typically need <code>repo</code>. For public-only, <code>public_repo</code> may be enough.
+      </div>
+    </div>
 
-    <h2>Disconnect</h2>
-    <p>${has ? "You can disconnect from this browser below." : "No active connection found in this browser."}</p>
-    ${has ? `
-      <form method="post" action="/disconnect">
-        <button type="submit" style="padding: 10px 14px; font-size: 16px;">Disconnect</button>
+    <div style="height: 10px"></div>
+    <p class="muted">Session: ${userId ? `<code>${userId}</code>` : "not set yet"}</p>
+  </div>
+</body>
+</html>
+  `);
+});
+
+app.post("/connect", (req, res) => {
+  const githubToken = (req.body.githubToken as string | undefined)?.trim() ?? "";
+  const returnToEnc = (req.body.returnTo as string | undefined) ?? "%2F";
+  const returnTo = decodeURIComponent(returnToEnc);
+
+  if (!githubToken || githubToken.length < 20) {
+    return res.status(400).send("Token missing or too short.");
+  }
+
+  const userId = getSessionUserId(req) ?? `u_${randomToken(12)}`;
+  ensureUser(userId);
+
+  const enc = encryptString(githubToken);
+
+  db.prepare(
+    `INSERT INTO user_secrets (userId, githubTokenEnc, updatedAt)
+     VALUES (?, ?, ?)
+     ON CONFLICT(userId) DO UPDATE SET githubTokenEnc=excluded.githubTokenEnc, updatedAt=excluded.updatedAt`,
+  ).run(userId, enc, nowMs());
+
+  setCookie(res, "mcp_session", signCookie({ userId }));
+  res.redirect(`/connect?ok=1&returnTo=${encodeURIComponent(returnTo)}`);
+});
+
+/**
+ * === OAuth authorize ===
+ */
+app.get("/oauth/authorize", (req, res) => {
+  const clientId = (req.query.client_id as string | undefined) ?? "";
+  const redirectUri = (req.query.redirect_uri as string | undefined) ?? "";
+  const responseType = (req.query.response_type as string | undefined) ?? "";
+  const state = (req.query.state as string | undefined) ?? "";
+  const scope = (req.query.scope as string | undefined) ?? "github.read";
+  const codeChallenge = (req.query.code_challenge as string | undefined) ?? "";
+  const codeChallengeMethod = (req.query.code_challenge_method as string | undefined) ?? "S256";
+
+  if (!clientId || !redirectUri || responseType !== "code") {
+    return res.status(400).send("Missing required OAuth parameters.");
+  }
+  if (!isAllowedRedirectUri(redirectUri)) {
+    return res.status(400).send("redirect_uri not allowed.");
+  }
+  if (!codeChallenge || !["S256", "plain"].includes(codeChallengeMethod)) {
+    return res.status(400).send("PKCE code_challenge is required (S256 or plain).");
+  }
+
+  // Upsert client record (public clients are ok, but we still track redirect URIs we saw).
+  const existing = db.prepare("SELECT redirectUrisJson FROM oauth_clients WHERE clientId = ?").get(clientId) as
+    | { redirectUrisJson: string }
+    | undefined;
+
+  const redirectUris = new Set<string>(safeJsonParse<string[]>(existing?.redirectUrisJson ?? "[]", []));
+  redirectUris.add(redirectUri);
+
+  const ts = nowMs();
+  db.prepare(
+    `INSERT INTO oauth_clients (clientId, redirectUrisJson, createdAt, updatedAt)
+     VALUES (?, ?, ?, ?)
+     ON CONFLICT(clientId) DO UPDATE SET redirectUrisJson=excluded.redirectUrisJson, updatedAt=excluded.updatedAt`,
+  ).run(clientId, JSON.stringify([...redirectUris]), ts, ts);
+
+  // Require user to have connected GitHub token first
+  const connected = requireConnectedUser(req);
+  if (!connected) {
+    const fullReturn = `${BASE_URL}/oauth/authorize?${new URLSearchParams(req.query as any).toString()}`;
+    return res.redirect(`/connect?returnTo=${encodeURIComponent(fullReturn)}`);
+  }
+
+  // Consent screen
+  const scopes = scope.split(/\s+/).filter(Boolean);
+  res.setHeader("Content-Type", "text/html; charset=utf-8");
+  res.send(`
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>${APP_NAME} – Approve</title>
+  <style>
+    body { font-family: system-ui, -apple-system, Segoe UI, Roboto, sans-serif; margin: 0; padding: 24px; background:#0b0b0c; color:#fff; }
+    .card { max-width: 720px; margin: 0 auto; background:#141416; border:1px solid #2a2a2f; border-radius: 14px; padding: 18px; }
+    .muted { color:#b7b7c2; font-size: 14px; line-height: 1.4; }
+    .row { display:flex; gap:12px; margin-top: 14px; }
+    button { flex:1; padding: 12px 14px; border-radius: 10px; border: 0; font-weight: 700; cursor:pointer; }
+    .approve { background: #2b6cff; color:#fff; }
+    .deny { background: #2a2a2f; color:#fff; }
+    ul { margin: 8px 0 0 18px; }
+    code { background:#0f0f12; padding: 2px 6px; border-radius: 6px; }
+  </style>
+</head>
+<body>
+  <div class="card">
+    <h2>Allow ChatGPT to access GitHub?</h2>
+    <p class="muted">
+      You are approving access from <code>${clientId}</code> via ${APP_NAME}.
+    </p>
+
+    <div class="muted" style="margin-top:10px;">
+      Requested permissions:
+      <ul>
+        ${scopes.map((s) => `<li><code>${s}</code></li>`).join("")}
+      </ul>
+    </div>
+
+    <div class="row">
+      <form method="POST" action="/oauth/approve" style="flex:1">
+        ${["client_id","redirect_uri","response_type","state","scope","code_challenge","code_challenge_method"]
+          .map((k) => `<input type="hidden" name="${k}" value="${String((req.query as any)[k] ?? "")}" />`)
+          .join("")}
+        <button class="approve" type="submit">Approve</button>
       </form>
-    ` : ""}
-  </body>
-</html>`);
-  });
 
-  app.post("/oauth/authorize", (req, res) => {
-    setNoStore(res);
+      <form method="POST" action="/oauth/deny" style="flex:1">
+        ${["redirect_uri","state"].map((k) => `<input type="hidden" name="${k}" value="${String((req.query as any)[k] ?? "")}" />`).join("")}
+        <button class="deny" type="submit">Deny</button>
+      </form>
+    </div>
 
-    const {
-      response_type,
-      client_id,
-      redirect_uri,
-      scope = "snaptask",
-      state,
-      code_challenge,
-      code_challenge_method,
-      snaptask_token,
-    } = req.body as Record<string, string>;
+    <p class="muted" style="margin-top:12px;">
+      Tip: If you need write actions (create issues), request <code>github.write</code>.
+    </p>
+  </div>
+</body>
+</html>
+  `);
+});
 
-    if (response_type !== "code") return res.status(400).send("Invalid response_type");
-    if (!client_id || !redirect_uri || !state) return res.status(400).send("Missing required fields");
-    if (!code_challenge || code_challenge_method !== "S256") return res.status(400).send("PKCE S256 required");
+app.post("/oauth/deny", (req, res) => {
+  const redirectUri = (req.body.redirect_uri as string | undefined) ?? "";
+  const state = (req.body.state as string | undefined) ?? "";
+  if (!redirectUri) return res.status(400).send("Missing redirect_uri");
+  const u = new URL(redirectUri);
+  u.searchParams.set("error", "access_denied");
+  if (state) u.searchParams.set("state", state);
+  res.redirect(u.toString());
+});
 
-    const token = String(snaptask_token || "").trim();
-    if (token.length < 10) return res.status(400).send("Invalid SnapTask token");
+app.post("/oauth/approve", (req, res) => {
+  const clientId = (req.body.client_id as string | undefined) ?? "";
+  const redirectUri = (req.body.redirect_uri as string | undefined) ?? "";
+  const state = (req.body.state as string | undefined) ?? "";
+  const scope = (req.body.scope as string | undefined) ?? "github.read";
+  const codeChallenge = (req.body.code_challenge as string | undefined) ?? "";
+  const codeChallengeMethod = (req.body.code_challenge_method as string | undefined) ?? "S256";
 
-    // Create a connected account (single account per connection session)
-    const { accountId, manageToken } = upsertSingleAccount(token);
-    setCookie(res, "snaptask_manage", manageToken);
+  if (!clientId || !redirectUri || !codeChallenge) {
+    return res.status(400).send("Missing OAuth params.");
+  }
+  if (!isAllowedRedirectUri(redirectUri)) {
+    return res.status(400).send("redirect_uri not allowed.");
+  }
 
-    const code = createAuthCode({
-      clientId: client_id,
-      redirectUri: redirect_uri,
-      codeChallenge: code_challenge,
-      codeChallengeMethod: code_challenge_method,
-      scope,
-      accountId,
+  const connected = requireConnectedUser(req);
+  if (!connected) {
+    return res.status(400).send("Not connected. Go to /connect first.");
+  }
+
+  const code = `c_${randomToken(24)}`;
+  const expiresAt = nowMs() + 5 * 60 * 1000; // 5 minutes
+
+  db.prepare(
+    `INSERT INTO oauth_codes (code, clientId, userId, redirectUri, scope, codeChallenge, codeChallengeMethod, expiresAt)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+  ).run(code, clientId, connected.userId, redirectUri, scope, codeChallenge, codeChallengeMethod, expiresAt);
+
+  const u = new URL(redirectUri);
+  u.searchParams.set("code", code);
+  if (state) u.searchParams.set("state", state);
+  res.redirect(u.toString());
+});
+
+/**
+ * === OAuth token ===
+ * Supports:
+ * - authorization_code with PKCE verifier
+ * - refresh_token
+ *
+ * Token endpoint auth method: none OR client_secret_post (optional).
+ */
+app.post("/oauth/token", (req, res) => {
+  const grantType = (req.body.grant_type as string | undefined) ?? "";
+  const clientId = (req.body.client_id as string | undefined) ?? "";
+  const clientSecret = (req.body.client_secret as string | undefined) ?? ""; // optional
+  const code = (req.body.code as string | undefined) ?? "";
+  const redirectUri = (req.body.redirect_uri as string | undefined) ?? "";
+  const codeVerifier = (req.body.code_verifier as string | undefined) ?? "";
+  const refreshToken = (req.body.refresh_token as string | undefined) ?? "";
+
+  if (!clientId) return res.status(400).json({ error: "invalid_request" });
+
+  // We currently allow public clients (no secret) — which is what ChatGPT typically uses with PKCE.
+  // If you want to lock this down later, add an allowlist of client_ids here.
+
+  if (grantType === "authorization_code") {
+    if (!code || !redirectUri || !codeVerifier) {
+      return res.status(400).json({ error: "invalid_request" });
+    }
+
+    const row = db.prepare("SELECT * FROM oauth_codes WHERE code = ?").get(code) as any;
+    if (!row) return res.status(400).json({ error: "invalid_grant" });
+    if (row.clientId !== clientId) return res.status(400).json({ error: "invalid_grant" });
+    if (row.redirectUri !== redirectUri) return res.status(400).json({ error: "invalid_grant" });
+    if (nowMs() > row.expiresAt) return res.status(400).json({ error: "invalid_grant" });
+
+    // PKCE check
+    let expected = "";
+    if (row.codeChallengeMethod === "plain") expected = codeVerifier;
+    else expected = sha256Base64Url(codeVerifier);
+
+    if (expected !== row.codeChallenge) return res.status(400).json({ error: "invalid_grant" });
+
+    // One-time use
+    db.prepare("DELETE FROM oauth_codes WHERE code = ?").run(code);
+
+    const accessToken = `at_${randomToken(32)}`;
+    const refresh = `rt_${randomToken(32)}`;
+
+    const accessHash = sha256Base64Url(accessToken);
+    const refreshHash = sha256Base64Url(refresh);
+
+    const accessExpiresAt = nowMs() + 60 * 60 * 1000; // 1 hour
+    const refreshExpiresAt = nowMs() + 30 * 24 * 60 * 60 * 1000; // 30 days
+
+    db.prepare(
+      `INSERT INTO oauth_tokens (accessTokenHash, refreshTokenHash, clientId, userId, scope, accessExpiresAt, refreshExpiresAt, createdAt)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+    ).run(accessHash, refreshHash, clientId, row.userId, row.scope, accessExpiresAt, refreshExpiresAt, nowMs());
+
+    return res.json({
+      token_type: "Bearer",
+      access_token: accessToken,
+      refresh_token: refresh,
+      expires_in: 3600,
+      scope: row.scope,
     });
+  }
 
-    const redirect = new URL(redirect_uri);
-    redirect.searchParams.set("code", code);
-    redirect.searchParams.set("state", state);
+  if (grantType === "refresh_token") {
+    if (!refreshToken) return res.status(400).json({ error: "invalid_request" });
 
-    return res.redirect(redirect.toString());
-  });
+    const refreshHash = sha256Base64Url(refreshToken);
+    const row = db.prepare("SELECT * FROM oauth_tokens WHERE refreshTokenHash = ?").get(refreshHash) as any;
+    if (!row) return res.status(400).json({ error: "invalid_grant" });
+    if (row.clientId !== clientId) return res.status(400).json({ error: "invalid_grant" });
+    if (nowMs() > row.refreshExpiresAt) return res.status(400).json({ error: "invalid_grant" });
 
-  // --- Token endpoint (code exchange + refresh) ---
-  app.post("/oauth/token", (req, res) => {
-    setNoStore(res);
+    // Rotate tokens
+    db.prepare("DELETE FROM oauth_tokens WHERE refreshTokenHash = ?").run(refreshHash);
 
-    const grantType = String(req.body?.grant_type || "");
+    const accessToken = `at_${randomToken(32)}`;
+    const refresh = `rt_${randomToken(32)}`;
 
-    try {
-      if (grantType === "authorization_code") {
-        const code = String(req.body?.code || "");
-        const redirectUri = String(req.body?.redirect_uri || "");
-        const clientId = String(req.body?.client_id || "");
-        const verifier = String(req.body?.code_verifier || "");
+    const accessHash = sha256Base64Url(accessToken);
+    const newRefreshHash = sha256Base64Url(refresh);
 
-        const out = exchangeAuthCode({ code, clientId, redirectUri, codeVerifier: verifier });
+    const accessExpiresAt = nowMs() + 60 * 60 * 1000;
+    const refreshExpiresAt = nowMs() + 30 * 24 * 60 * 60 * 1000;
 
-        return res.json({
-          access_token: out.accessToken,
-          token_type: "bearer",
-          expires_in: out.expiresIn,
-          refresh_token: out.refreshToken,
-          scope: out.scope,
-        });
-      }
+    db.prepare(
+      `INSERT INTO oauth_tokens (accessTokenHash, refreshTokenHash, clientId, userId, scope, accessExpiresAt, refreshExpiresAt, createdAt)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+    ).run(accessHash, newRefreshHash, clientId, row.userId, row.scope, accessExpiresAt, refreshExpiresAt, nowMs());
 
-      if (grantType === "refresh_token") {
-        const refreshToken = String(req.body?.refresh_token || "");
-        const clientId = String(req.body?.client_id || "");
-        if (!refreshToken || !clientId) throw new Error("Missing refresh_token or client_id");
+    return res.json({
+      token_type: "Bearer",
+      access_token: accessToken,
+      refresh_token: refresh,
+      expires_in: 3600,
+      scope: row.scope,
+    });
+  }
 
-        const out = refreshAccessToken({ refreshToken, clientId });
+  return res.status(400).json({ error: "unsupported_grant_type" });
+});
 
-        return res.json({
-          access_token: out.accessToken,
-          token_type: "bearer",
-          expires_in: out.expiresIn,
-          refresh_token: out.refreshToken,
-          scope: out.scope,
-        });
-      }
+app.post("/oauth/revoke", (req, res) => {
+  const token = (req.body.token as string | undefined) ?? "";
+  if (!token) return res.status(200).send(""); // per RFC, revocation is best-effort
 
-      return res.status(400).json({ error: "unsupported_grant_type" });
-    } catch (e: any) {
-      return res.status(400).json({ error: "invalid_request", error_description: e?.message || "token error" });
-    }
-  });
+  const hash = sha256Base64Url(token);
+  db.prepare("DELETE FROM oauth_tokens WHERE accessTokenHash = ? OR refreshTokenHash = ?").run(hash, hash);
+  res.status(200).send("");
+});
 
-  // --- Revocation endpoint (ChatGPT disconnect) ---
-  app.post("/oauth/revoke", (req, res) => {
-    setNoStore(res);
+/**
+ * === MCP ===
+ * Minimal MCP-ish JSON-RPC handling:
+ * - tools/list
+ * - tools/call
+ *
+ * Authorization: Bearer <access_token>
+ */
+type McpRequest = {
+  jsonrpc?: string;
+  id?: string | number | null;
+  method: string;
+  params?: any;
+};
 
-    const token = String(req.body?.token || req.body?.refresh_token || "").trim();
-    if (!token) return res.status(200).send("");
-
-    const refreshHash = sha256Base64Url(token);
-    const row = db
-      .prepare(
-        `SELECT * FROM oauth_tokens WHERE refresh_token_hash = ? ORDER BY created_at DESC LIMIT 1`,
-      )
-      .get(refreshHash) as { account_id: string } | undefined;
-
-    if (row?.account_id) {
-      // Revoke everything for that account
-      revokeAccount(row.account_id);
-    }
-
-    return res.status(200).send("");
-  });
-
-  // --- Browser disconnect button (uses manage-token cookie) ---
-  app.post("/disconnect", (req, res) => {
-    setNoStore(res);
-
-    const manage = getCookie(req, "snaptask_manage");
-    if (manage) {
-      const acct = getAccountByManageToken(manage);
-      if (acct?.id) revokeAccount(acct.id);
-    }
-
-    clearCookie(res, "snaptask_manage");
-    return res.redirect("/connect");
-  });
-
-  // =========================
-  // MCP HTTP endpoint
-  // =========================
-
-  const mcpServer = getServer();
-
-  // Auth middleware: every MCP call requires Bearer token
-  app.post("/mcp", async (req, res) => {
-    const auth = parseAuthHeader(getHeader(req, "authorization"));
-
-    const validated = auth ? validateBearerAccessToken(auth) : null;
-    if (!validated) {
-      // Trigger ChatGPT "Connect"
-      res.status(401);
-      res.setHeader("WWW-Authenticate", wwwAuthenticateHeaderValue());
-      return res.send("");
-    }
-
-    // Attach token for tool handlers
-    const extra = {
-      requestInfo: { headers: req.headers },
-      requestContext: { snaptaskToken: validated.snaptaskToken },
-    };
-
-    // ---- MCP dispatch (SDK-dependent) ----
-    // This assumes your McpServer instance supports handleRequest(requestJson, extra).
-    // If your SDK uses a different method, only adjust this section.
-    try {
-      const result = await (mcpServer as any).handleRequest(req.body, extra);
-      res.type("application/json").send(result);
-    } catch (e: any) {
-      // If a tool threw an UNAUTHORIZED error, convert to the required 401 header
-      if (e?.code === "UNAUTHORIZED" || String(e?.message || "").toLowerCase().includes("unauthorized")) {
-        res.status(401);
-        res.setHeader("WWW-Authenticate", wwwAuthenticateHeaderValue());
-        return res.send("");
-      }
-
-      res.status(500).json({ error: "mcp_error", message: e?.message || "Unknown error" });
-    }
-  });
-
-  app.listen(PORT, () => {
-    console.log(`SnapTask MCP+OAuth server listening on :${PORT}`);
-    console.log(`Base URL: ${BASE_URL}`);
-  });
+function jsonRpcResult(id: any, result: any) {
+  return { jsonrpc: "2.0", id: id ?? null, result };
 }
 
-// Minimal HTML escaping
-function escapeHtml(s: string) {
-  return String(s)
-    .replaceAll("&", "&amp;")
-    .replaceAll("<", "&lt;")
-    .replaceAll(">", "&gt;")
-    .replaceAll('"', "&quot;")
-    .replaceAll("'", "&#039;");
+function jsonRpcError(id: any, code: number, message: string, data?: any) {
+  return { jsonrpc: "2.0", id: id ?? null, error: { code, message, data } };
 }
 
-// Auto-start if run directly
-void start();
+function requireBearer(req: any) {
+  const auth = (req.headers.authorization as string | undefined) ?? "";
+  const m = auth.match(/^Bearer\s+(.+)$/i);
+  return m?.[1] ?? null;
+}
+
+function getTokenRow(accessToken: string) {
+  const hash = sha256Base64Url(accessToken);
+  const row = db.prepare("SELECT * FROM oauth_tokens WHERE accessTokenHash = ?").get(hash) as any;
+  if (!row) return null;
+  if (nowMs() > row.accessExpiresAt) return null;
+  return row;
+}
+
+function hasScope(scopeStr: string, needed: "github.read" | "github.write") {
+  const scopes = scopeStr.split(/\s+/).filter(Boolean);
+  if (needed === "github.read") return scopes.includes("github.read") || scopes.includes("github.write");
+  return scopes.includes("github.write");
+}
+
+async function githubFetch(userId: string, url: string, init?: RequestInit) {
+  const secret = db.prepare("SELECT githubTokenEnc FROM user_secrets WHERE userId = ?").get(userId) as
+    | { githubTokenEnc: string }
+    | undefined;
+  if (!secret?.githubTokenEnc) throw new Error("No GitHub token connected. Visit /connect");
+
+  const pat = decryptString(secret.githubTokenEnc);
+
+  const resp = await fetch(url, {
+    ...(init ?? {}),
+    headers: {
+      Accept: "application/vnd.github+json",
+      Authorization: `Bearer ${pat}`,
+      "User-Agent": "snappy-mcp",
+      ...(init?.headers ?? {}),
+    },
+  });
+
+  const text = await resp.text();
+  let json: any = null;
+  try {
+    json = JSON.parse(text);
+  } catch {
+    json = { raw: text };
+  }
+
+  if (!resp.ok) {
+    throw new Error(`GitHub error ${resp.status}: ${json?.message ?? "Request failed"}`);
+  }
+
+  return json;
+}
+
+const tools = [
+  {
+    name: "github.search_repositories",
+    description: "Search GitHub repositories by keyword.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        query: { type: "string", description: "Search query, e.g. 'mcp language:typescript'" },
+        perPage: { type: "number", description: "Max results (1-50).", default: 10 },
+      },
+      required: ["query"],
+    },
+    requiredScope: "github.read" as const,
+  },
+  {
+    name: "github.list_repo_issues",
+    description: "List issues in a repo (can include PRs if GitHub marks them as issues).",
+    inputSchema: {
+      type: "object",
+      properties: {
+        owner: { type: "string" },
+        repo: { type: "string" },
+        state: { type: "string", enum: ["open", "closed", "all"], default: "open" },
+        perPage: { type: "number", default: 20 },
+      },
+      required: ["owner", "repo"],
+    },
+    requiredScope: "github.read" as const,
+  },
+  {
+    name: "github.list_repo_prs",
+    description: "List pull requests in a repo.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        owner: { type: "string" },
+        repo: { type: "string" },
+        state: { type: "string", enum: ["open", "closed", "all"], default: "open" },
+        perPage: { type: "number", default: 20 },
+      },
+      required: ["owner", "repo"],
+    },
+    requiredScope: "github.read" as const,
+  },
+  {
+    name: "github.get_file",
+    description: "Get file contents from a repo path (base64 decoded).",
+    inputSchema: {
+      type: "object",
+      properties: {
+        owner: { type: "string" },
+        repo: { type: "string" },
+        path: { type: "string", description: "File path in the repo" },
+        ref: { type: "string", description: "Branch/tag/sha (optional)" },
+      },
+      required: ["owner", "repo", "path"],
+    },
+    requiredScope: "github.read" as const,
+  },
+  {
+    name: "github.create_issue",
+    description: "Create a GitHub issue in a repo.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        owner: { type: "string" },
+        repo: { type: "string" },
+        title: { type: "string" },
+        body: { type: "string" },
+        labels: { type: "array", items: { type: "string" } },
+      },
+      required: ["owner", "repo", "title"],
+    },
+    requiredScope: "github.write" as const,
+  },
+];
+
+app.post("/mcp", async (req, res) => {
+  const bearer = requireBearer(req);
+  if (!bearer) return res.status(401).json(jsonRpcError(req.body?.id, 401, "Missing Bearer token"));
+
+  const tokenRow = getTokenRow(bearer);
+  if (!tokenRow) return res.status(401).json(jsonRpcError(req.body?.id, 401, "Invalid or expired token"));
+
+  const userId = tokenRow.userId as string;
+  const scope = tokenRow.scope as string;
+
+  const body = req.body as McpRequest;
+  const id = body?.id ?? null;
+
+  try {
+    if (!body || !body.method) {
+      return res.status(400).json(jsonRpcError(id, 400, "Invalid request"));
+    }
+
+    if (body.method === "tools/list") {
+      return res.json(
+        jsonRpcResult(id, {
+          tools: tools.map((t) => ({
+            name: t.name,
+            description: t.description,
+            inputSchema: t.inputSchema,
+          })),
+        }),
+      );
+    }
+
+    if (body.method === "tools/call") {
+      const toolName = body.params?.name as string | undefined;
+      const args = body.params?.arguments ?? {};
+
+      const tool = tools.find((t) => t.name === toolName);
+      if (!tool) return res.status(404).json(jsonRpcError(id, 404, "Tool not found"));
+
+      // Scope enforcement
+      if (tool.requiredScope === "github.write" && !hasScope(scope, "github.write")) {
+        return res.status(403).json(jsonRpcError(id, 403, "Missing scope github.write"));
+      }
+      if (tool.requiredScope === "github.read" && !hasScope(scope, "github.read")) {
+        return res.status(403).json(jsonRpcError(id, 403, "Missing scope github.read"));
+      }
+
+      // Execute tool
+      let result: any = null;
+
+      if (toolName === "github.search_repositories") {
+        const q = String(args.query ?? "");
+        const perPage = Math.max(1, Math.min(50, Number(args.perPage ?? 10)));
+        result = await githubFetch(
+          userId,
+          `https://api.github.com/search/repositories?q=${encodeURIComponent(q)}&per_page=${perPage}`,
+        );
+      } else if (toolName === "github.list_repo_issues") {
+        const owner = String(args.owner ?? "");
+        const repo = String(args.repo ?? "");
+        const state = String(args.state ?? "open");
+        const perPage = Math.max(1, Math.min(50, Number(args.perPage ?? 20)));
+        result = await githubFetch(
+          userId,
+          `https://api.github.com/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}/issues?state=${encodeURIComponent(
+            state,
+          )}&per_page=${perPage}`,
+        );
+      } else if (toolName === "github.list_repo_prs") {
+        const owner = String(args.owner ?? "");
+        const repo = String(args.repo ?? "");
+        const state = String(args.state ?? "open");
+        const perPage = Math.max(1, Math.min(50, Number(args.perPage ?? 20)));
+        result = await githubFetch(
+          userId,
+          `https://api.github.com/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}/pulls?state=${encodeURIComponent(
+            state,
+          )}&per_page=${perPage}`,
+        );
+      } else if (toolName === "github.get_file") {
+        const owner = String(args.owner ?? "");
+        const repo = String(args.repo ?? "");
+        const filePath = String(args.path ?? "");
+        const ref = args.ref ? `?ref=${encodeURIComponent(String(args.ref))}` : "";
+        const json = await githubFetch(
+          userId,
+          `https://api.github.com/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}/contents/${encodeURIComponent(
+            filePath,
+          )}${ref}`,
+        );
+        // GitHub returns { content: base64, encoding: 'base64' }
+        if (json?.content && json?.encoding === "base64") {
+          const decoded = Buffer.from(String(json.content).replace(/\n/g, ""), "base64").toString("utf8");
+          result = { ...json, decodedText: decoded };
+        } else {
+          result = json;
+        }
+      } else if (toolName === "github.create_issue") {
+        const owner = String(args.owner ?? "");
+        const repo = String(args.repo ?? "");
+        const title = String(args.title ?? "");
+        const bodyText = args.body ? String(args.body) : undefined;
+        const labels = Array.isArray(args.labels) ? args.labels.map(String) : undefined;
+
+        result = await githubFetch(
+          userId,
+          `https://api.github.com/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}/issues`,
+          {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ title, body: bodyText, labels }),
+          },
+        );
+      } else {
+        return res.status(400).json(jsonRpcError(id, 400, "Tool not implemented"));
+      }
+
+      return res.json(
+        jsonRpcResult(id, {
+          content: [{ type: "text", text: JSON.stringify(result, null, 2) }],
+        }),
+      );
+    }
+
+    // Basic handshake methods some clients send
+    if (body.method === "initialize") {
+      return res.json(
+        jsonRpcResult(id, {
+          name: APP_NAME,
+          version: "1.0.0",
+          capabilities: { tools: {} },
+        }),
+      );
+    }
+
+    return res.status(404).json(jsonRpcError(id, 404, "Method not found"));
+  } catch (e: any) {
+    return res.status(500).json(jsonRpcError(id, 500, e?.message ?? "Server error"));
+  }
+});
+
+/**
+ * Small homepage
+ */
+app.get("/", (_req, res) => {
+  res.setHeader("Content-Type", "text/plain; charset=utf-8");
+  res.send(
+    [
+      `${APP_NAME} is running.`,
+      ``,
+      `Connect page: ${BASE_URL}/connect`,
+      `MCP endpoint: POST ${BASE_URL}/mcp`,
+      `OAuth metadata:`,
+      `- ${BASE_URL}/.well-known/oauth-protected-resource`,
+      `- ${BASE_URL}/.well-known/oauth-authorization-server`,
+    ].join("\n"),
+  );
+});
+
+const port = Number(process.env.PORT ?? 3000);
+app.listen(port, () => {
+  // eslint-disable-next-line no-console
+  console.log(`[server] ${APP_NAME} listening on port ${port}`);
+  // eslint-disable-next-line no-console
+  console.log(`[server] BASE_URL = ${BASE_URL}`);
+});

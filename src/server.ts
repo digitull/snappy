@@ -1,90 +1,56 @@
 import express from "express";
 import crypto from "crypto";
 import path from "path";
-import Database from "better-sqlite3";
+import fs from "fs";
 
-const app = express();
+type OAuthCodeRow = {
+  code: string;
+  clientId: string;
+  userId: string;
+  redirectUri: string;
+  scope: string;
+  codeChallenge: string;
+  codeChallengeMethod: "S256" | "plain";
+  expiresAt: number;
+};
 
-// ChatGPT often sends JSON
-app.use(express.json({ limit: "2mb" }));
-app.use(express.urlencoded({ extended: true }));
+type OAuthTokenRow = {
+  accessTokenHash: string;
+  refreshTokenHash: string;
+  clientId: string;
+  userId: string;
+  scope: string;
+  accessExpiresAt: number;
+  refreshExpiresAt: number;
+  createdAt: number;
+};
 
-/**
- * === REQUIRED ENV ===
- * PUBLIC_BASE_URL   e.g. https://snappy-8615fb5a.alpic.live
- * SERVER_SECRET     long random string (REQUIRED in production)
- *
- * === OPTIONAL ENV ===
- * OAUTH_DB_PATH     default ./oauth.sqlite
- * APP_NAME          default "Snappy MCP"
- * ALLOWED_REDIRECT_URI_PREFIXES comma-separated prefixes allowed (defaults include chatgpt.com + chat.openai.com)
- */
+type OAuthClientRow = {
+  clientId: string;
+  redirectUris: string[];
+  createdAt: number;
+  updatedAt: number;
+};
 
-const BASE_URL = (process.env.PUBLIC_BASE_URL ?? "https://snappy-8615fb5a.alpic.live").replace(/\/$/, "");
-const APP_NAME = process.env.APP_NAME ?? "Snappy MCP";
-const DB_PATH = process.env.OAUTH_DB_PATH ?? path.join(process.cwd(), "oauth.sqlite");
+type UserRow = {
+  id: string;
+  createdAt: number;
+};
 
-const ALLOWED_REDIRECT_URI_PREFIXES = (process.env.ALLOWED_REDIRECT_URI_PREFIXES ??
-  "https://chat.openai.com/,https://chatgpt.com/")
-  .split(",")
-  .map((s) => s.trim())
-  .filter(Boolean);
+type UserSecretRow = {
+  userId: string;
+  githubTokenEnc: string;
+  updatedAt: number;
+};
 
-const SERVER_SECRET = process.env.SERVER_SECRET ?? "";
-if (!SERVER_SECRET || SERVER_SECRET.length < 32) {
-  // This is a security requirement. If you want to allow local dev without it, set NODE_ENV != production.
-  if (process.env.NODE_ENV === "production") {
-    throw new Error("SERVER_SECRET must be set to a long random string in production.");
-  }
-}
-
-const db = new Database(DB_PATH);
-db.pragma("journal_mode = WAL");
-
-db.exec(`
-  CREATE TABLE IF NOT EXISTS users (
-    id TEXT PRIMARY KEY,
-    createdAt INTEGER NOT NULL
-  );
-
-  CREATE TABLE IF NOT EXISTS user_secrets (
-    userId TEXT PRIMARY KEY,
-    githubTokenEnc TEXT NOT NULL,
-    updatedAt INTEGER NOT NULL,
-    FOREIGN KEY(userId) REFERENCES users(id) ON DELETE CASCADE
-  );
-
-  CREATE TABLE IF NOT EXISTS oauth_clients (
-    clientId TEXT PRIMARY KEY,
-    redirectUrisJson TEXT NOT NULL,
-    createdAt INTEGER NOT NULL,
-    updatedAt INTEGER NOT NULL
-  );
-
-  CREATE TABLE IF NOT EXISTS oauth_codes (
-    code TEXT PRIMARY KEY,
-    clientId TEXT NOT NULL,
-    userId TEXT NOT NULL,
-    redirectUri TEXT NOT NULL,
-    scope TEXT NOT NULL,
-    codeChallenge TEXT NOT NULL,
-    codeChallengeMethod TEXT NOT NULL,
-    expiresAt INTEGER NOT NULL
-  );
-
-  CREATE TABLE IF NOT EXISTS oauth_tokens (
-    accessTokenHash TEXT PRIMARY KEY,
-    refreshTokenHash TEXT NOT NULL,
-    clientId TEXT NOT NULL,
-    userId TEXT NOT NULL,
-    scope TEXT NOT NULL,
-    accessExpiresAt INTEGER NOT NULL,
-    refreshExpiresAt INTEGER NOT NULL,
-    createdAt INTEGER NOT NULL
-  );
-
-  CREATE INDEX IF NOT EXISTS oauth_tokens_refresh_idx ON oauth_tokens(refreshTokenHash);
-`);
+type StoreShape = {
+  users: Record<string, UserRow>;
+  userSecrets: Record<string, UserSecretRow>;
+  oauthClients: Record<string, OAuthClientRow>;
+  oauthCodes: Record<string, OAuthCodeRow>;
+  oauthTokensByAccessHash: Record<string, OAuthTokenRow>;
+  oauthTokensByRefreshHash: Record<string, OAuthTokenRow>;
+};
 
 function nowMs() {
   return Date.now();
@@ -115,12 +81,71 @@ function safeJsonParse<T>(s: string, fallback: T): T {
   }
 }
 
+/**
+ * === REQUIRED ENV ===
+ * PUBLIC_BASE_URL   e.g. https://snappy-8615fb5a.alpic.live
+ * SERVER_SECRET     long random string (REQUIRED in production)
+ *
+ * === OPTIONAL ENV ===
+ * OAUTH_STORE_PATH  default ./oauth-store.json
+ * APP_NAME          default "Snappy MCP"
+ * ALLOWED_REDIRECT_URI_PREFIXES comma-separated prefixes allowed (defaults include chatgpt.com + chat.openai.com)
+ */
+const BASE_URL = (process.env.PUBLIC_BASE_URL ?? "https://snappy-8615fb5a.alpic.live").replace(/\/$/, "");
+const APP_NAME = process.env.APP_NAME ?? "Snappy MCP";
+const STORE_PATH = process.env.OAUTH_STORE_PATH ?? path.join(process.cwd(), "oauth-store.json");
+
+const ALLOWED_REDIRECT_URI_PREFIXES = (process.env.ALLOWED_REDIRECT_URI_PREFIXES ??
+  "https://chat.openai.com/,https://chatgpt.com/")
+  .split(",")
+  .map((s) => s.trim())
+  .filter(Boolean);
+
+const SERVER_SECRET = process.env.SERVER_SECRET ?? "";
+if (!SERVER_SECRET || SERVER_SECRET.length < 32) {
+  if (process.env.NODE_ENV === "production") {
+    throw new Error("SERVER_SECRET must be set to a long random string in production.");
+  }
+}
+
 function isAllowedRedirectUri(redirectUri: string) {
   return ALLOWED_REDIRECT_URI_PREFIXES.some((prefix) => redirectUri.startsWith(prefix));
 }
 
+function loadStore(): StoreShape {
+  if (!fs.existsSync(STORE_PATH)) {
+    return {
+      users: {},
+      userSecrets: {},
+      oauthClients: {},
+      oauthCodes: {},
+      oauthTokensByAccessHash: {},
+      oauthTokensByRefreshHash: {},
+    };
+  }
+
+  const raw = fs.readFileSync(STORE_PATH, "utf8");
+  const parsed = safeJsonParse<StoreShape>(raw, null as any);
+
+  return (
+    parsed ?? {
+      users: {},
+      userSecrets: {},
+      oauthClients: {},
+      oauthCodes: {},
+      oauthTokensByAccessHash: {},
+      oauthTokensByRefreshHash: {},
+    }
+  );
+}
+
+function saveStore(store: StoreShape) {
+  const tmp = `${STORE_PATH}.tmp`;
+  fs.writeFileSync(tmp, JSON.stringify(store, null, 2), "utf8");
+  fs.renameSync(tmp, STORE_PATH);
+}
+
 function deriveKey() {
-  // 32-byte key for AES-256-GCM
   return crypto.createHash("sha256").update(SERVER_SECRET || "dev-secret").digest();
 }
 
@@ -130,7 +155,6 @@ function encryptString(plain: string) {
   const cipher = crypto.createCipheriv("aes-256-gcm", key, iv);
   const ciphertext = Buffer.concat([cipher.update(Buffer.from(plain, "utf8")), cipher.final()]);
   const tag = cipher.getAuthTag();
-  // iv.tag.ciphertext (base64url)
   return `${base64Url(iv)}.${base64Url(tag)}.${base64Url(ciphertext)}`;
 }
 
@@ -155,6 +179,7 @@ function signCookie(payload: object) {
   const mac = crypto.createHmac("sha256", SERVER_SECRET || "dev-secret").update(json).digest("base64url");
   return `${base64Url(Buffer.from(json, "utf8"))}.${mac}`;
 }
+
 function verifyCookie<T>(cookie: string): T | null {
   const [payloadB64, mac] = cookie.split(".");
   if (!payloadB64 || !mac) return null;
@@ -179,22 +204,7 @@ function getCookie(req: any, name: string) {
 }
 
 function setCookie(res: any, name: string, value: string) {
-  // Lax works well for OAuth redirects
   res.setHeader("Set-Cookie", `${name}=${encodeURIComponent(value)}; Path=/; HttpOnly; SameSite=Lax; Secure`);
-}
-
-function clearCookie(res: any, name: string) {
-  res.setHeader(
-    "Set-Cookie",
-    `${name}=; Path=/; HttpOnly; SameSite=Lax; Secure; Expires=Thu, 01 Jan 1970 00:00:00 GMT`,
-  );
-}
-
-function ensureUser(userId: string) {
-  const existing = db.prepare("SELECT id FROM users WHERE id = ?").get(userId);
-  if (!existing) {
-    db.prepare("INSERT INTO users (id, createdAt) VALUES (?, ?)").run(userId, nowMs());
-  }
 }
 
 function getSessionUserId(req: any): string | null {
@@ -204,397 +214,6 @@ function getSessionUserId(req: any): string | null {
   return payload?.userId ?? null;
 }
 
-function requireConnectedUser(req: any) {
-  const userId = getSessionUserId(req);
-  if (!userId) return null;
-  ensureUser(userId);
-  const secret = db.prepare("SELECT githubTokenEnc FROM user_secrets WHERE userId = ?").get(userId) as
-    | { githubTokenEnc: string }
-    | undefined;
-  if (!secret?.githubTokenEnc) return null;
-  return { userId, githubTokenEnc: secret.githubTokenEnc };
-}
-
-/**
- * === Public well-known docs for ChatGPT ===
- */
-app.get("/.well-known/oauth-protected-resource", (_req, res) => {
-  res.json({
-    resource: BASE_URL,
-    authorization_servers: [`${BASE_URL}/.well-known/oauth-authorization-server`],
-  });
-});
-
-app.get("/.well-known/oauth-authorization-server", (_req, res) => {
-  res.json({
-    issuer: BASE_URL,
-    authorization_endpoint: `${BASE_URL}/oauth/authorize`,
-    token_endpoint: `${BASE_URL}/oauth/token`,
-    revocation_endpoint: `${BASE_URL}/oauth/revoke`,
-    response_types_supported: ["code"],
-    grant_types_supported: ["authorization_code", "refresh_token"],
-    code_challenge_methods_supported: ["S256", "plain"],
-    token_endpoint_auth_methods_supported: ["none", "client_secret_post"],
-    scopes_supported: ["github.read", "github.write"],
-  });
-});
-
-/**
- * === Connect screen ===
- * User pastes a GitHub personal access token (PAT).
- * We store it encrypted and bind it to a signed session cookie.
- */
-app.get("/connect", (req, res) => {
-  const returnTo = (req.query.returnTo as string | undefined) ?? "/";
-  const userId = getSessionUserId(req);
-  const ok = req.query.ok === "1";
-
-  res.setHeader("Content-Type", "text/html; charset=utf-8");
-  res.send(`
-<!doctype html>
-<html>
-<head>
-  <meta charset="utf-8" />
-  <meta name="viewport" content="width=device-width,initial-scale=1" />
-  <title>${APP_NAME} – Connect</title>
-  <style>
-    body { font-family: system-ui, -apple-system, Segoe UI, Roboto, sans-serif; margin: 0; padding: 24px; background:#0b0b0c; color:#fff; }
-    .card { max-width: 720px; margin: 0 auto; background:#141416; border:1px solid #2a2a2f; border-radius: 14px; padding: 18px; }
-    a { color: #8ab4ff; }
-    input, textarea { width:100%; padding:12px; border-radius: 10px; border:1px solid #2a2a2f; background:#0f0f12; color:#fff; }
-    button { padding: 12px 14px; border-radius: 10px; border: 0; background: #2b6cff; color:#fff; font-weight: 600; cursor:pointer; }
-    .muted { color:#b7b7c2; font-size: 14px; line-height: 1.4; }
-    .ok { background:#0f2a16; border:1px solid #1f7a3a; padding:10px 12px; border-radius: 10px; margin-bottom: 12px; }
-    .warn { background:#2a1a0f; border:1px solid #a85a1a; padding:10px 12px; border-radius: 10px; margin-top: 12px; }
-    code { background:#0f0f12; padding: 2px 6px; border-radius: 6px; }
-  </style>
-</head>
-<body>
-  <div class="card">
-    <h2>${APP_NAME}: Connect GitHub</h2>
-    <p class="muted">
-      To let ChatGPT use your GitHub on your behalf, paste a <strong>GitHub Personal Access Token</strong> here.
-      We store it <strong>encrypted</strong> on this server and only use it when you approve access.
-    </p>
-
-    ${ok ? `<div class="ok">Saved. You can go back to ChatGPT and continue connecting.</div>` : ""}
-
-    <form method="POST" action="/connect">
-      <input type="hidden" name="returnTo" value="${encodeURIComponent(returnTo)}" />
-      <label class="muted">GitHub Personal Access Token</label>
-      <input name="githubToken" placeholder="ghp_..." autocomplete="off" />
-
-      <div style="height: 12px"></div>
-      <button type="submit">Save token</button>
-    </form>
-
-    <div class="warn">
-      <div class="muted">
-        Tip: Use a token with the minimal scopes you need.
-        For private repos, you typically need <code>repo</code>. For public-only, <code>public_repo</code> may be enough.
-      </div>
-    </div>
-
-    <div style="height: 10px"></div>
-    <p class="muted">Session: ${userId ? `<code>${userId}</code>` : "not set yet"}</p>
-  </div>
-</body>
-</html>
-  `);
-});
-
-app.post("/connect", (req, res) => {
-  const githubToken = (req.body.githubToken as string | undefined)?.trim() ?? "";
-  const returnToEnc = (req.body.returnTo as string | undefined) ?? "%2F";
-  const returnTo = decodeURIComponent(returnToEnc);
-
-  if (!githubToken || githubToken.length < 20) {
-    return res.status(400).send("Token missing or too short.");
-  }
-
-  const userId = getSessionUserId(req) ?? `u_${randomToken(12)}`;
-  ensureUser(userId);
-
-  const enc = encryptString(githubToken);
-
-  db.prepare(
-    `INSERT INTO user_secrets (userId, githubTokenEnc, updatedAt)
-     VALUES (?, ?, ?)
-     ON CONFLICT(userId) DO UPDATE SET githubTokenEnc=excluded.githubTokenEnc, updatedAt=excluded.updatedAt`,
-  ).run(userId, enc, nowMs());
-
-  setCookie(res, "mcp_session", signCookie({ userId }));
-  res.redirect(`/connect?ok=1&returnTo=${encodeURIComponent(returnTo)}`);
-});
-
-/**
- * === OAuth authorize ===
- */
-app.get("/oauth/authorize", (req, res) => {
-  const clientId = (req.query.client_id as string | undefined) ?? "";
-  const redirectUri = (req.query.redirect_uri as string | undefined) ?? "";
-  const responseType = (req.query.response_type as string | undefined) ?? "";
-  const state = (req.query.state as string | undefined) ?? "";
-  const scope = (req.query.scope as string | undefined) ?? "github.read";
-  const codeChallenge = (req.query.code_challenge as string | undefined) ?? "";
-  const codeChallengeMethod = (req.query.code_challenge_method as string | undefined) ?? "S256";
-
-  if (!clientId || !redirectUri || responseType !== "code") {
-    return res.status(400).send("Missing required OAuth parameters.");
-  }
-  if (!isAllowedRedirectUri(redirectUri)) {
-    return res.status(400).send("redirect_uri not allowed.");
-  }
-  if (!codeChallenge || !["S256", "plain"].includes(codeChallengeMethod)) {
-    return res.status(400).send("PKCE code_challenge is required (S256 or plain).");
-  }
-
-  // Upsert client record (public clients are ok, but we still track redirect URIs we saw).
-  const existing = db.prepare("SELECT redirectUrisJson FROM oauth_clients WHERE clientId = ?").get(clientId) as
-    | { redirectUrisJson: string }
-    | undefined;
-
-  const redirectUris = new Set<string>(safeJsonParse<string[]>(existing?.redirectUrisJson ?? "[]", []));
-  redirectUris.add(redirectUri);
-
-  const ts = nowMs();
-  db.prepare(
-    `INSERT INTO oauth_clients (clientId, redirectUrisJson, createdAt, updatedAt)
-     VALUES (?, ?, ?, ?)
-     ON CONFLICT(clientId) DO UPDATE SET redirectUrisJson=excluded.redirectUrisJson, updatedAt=excluded.updatedAt`,
-  ).run(clientId, JSON.stringify([...redirectUris]), ts, ts);
-
-  // Require user to have connected GitHub token first
-  const connected = requireConnectedUser(req);
-  if (!connected) {
-    const fullReturn = `${BASE_URL}/oauth/authorize?${new URLSearchParams(req.query as any).toString()}`;
-    return res.redirect(`/connect?returnTo=${encodeURIComponent(fullReturn)}`);
-  }
-
-  // Consent screen
-  const scopes = scope.split(/\s+/).filter(Boolean);
-  res.setHeader("Content-Type", "text/html; charset=utf-8");
-  res.send(`
-<!doctype html>
-<html>
-<head>
-  <meta charset="utf-8" />
-  <meta name="viewport" content="width=device-width,initial-scale=1" />
-  <title>${APP_NAME} – Approve</title>
-  <style>
-    body { font-family: system-ui, -apple-system, Segoe UI, Roboto, sans-serif; margin: 0; padding: 24px; background:#0b0b0c; color:#fff; }
-    .card { max-width: 720px; margin: 0 auto; background:#141416; border:1px solid #2a2a2f; border-radius: 14px; padding: 18px; }
-    .muted { color:#b7b7c2; font-size: 14px; line-height: 1.4; }
-    .row { display:flex; gap:12px; margin-top: 14px; }
-    button { flex:1; padding: 12px 14px; border-radius: 10px; border: 0; font-weight: 700; cursor:pointer; }
-    .approve { background: #2b6cff; color:#fff; }
-    .deny { background: #2a2a2f; color:#fff; }
-    ul { margin: 8px 0 0 18px; }
-    code { background:#0f0f12; padding: 2px 6px; border-radius: 6px; }
-  </style>
-</head>
-<body>
-  <div class="card">
-    <h2>Allow ChatGPT to access GitHub?</h2>
-    <p class="muted">
-      You are approving access from <code>${clientId}</code> via ${APP_NAME}.
-    </p>
-
-    <div class="muted" style="margin-top:10px;">
-      Requested permissions:
-      <ul>
-        ${scopes.map((s) => `<li><code>${s}</code></li>`).join("")}
-      </ul>
-    </div>
-
-    <div class="row">
-      <form method="POST" action="/oauth/approve" style="flex:1">
-        ${["client_id","redirect_uri","response_type","state","scope","code_challenge","code_challenge_method"]
-          .map((k) => `<input type="hidden" name="${k}" value="${String((req.query as any)[k] ?? "")}" />`)
-          .join("")}
-        <button class="approve" type="submit">Approve</button>
-      </form>
-
-      <form method="POST" action="/oauth/deny" style="flex:1">
-        ${["redirect_uri","state"].map((k) => `<input type="hidden" name="${k}" value="${String((req.query as any)[k] ?? "")}" />`).join("")}
-        <button class="deny" type="submit">Deny</button>
-      </form>
-    </div>
-
-    <p class="muted" style="margin-top:12px;">
-      Tip: If you need write actions (create issues), request <code>github.write</code>.
-    </p>
-  </div>
-</body>
-</html>
-  `);
-});
-
-app.post("/oauth/deny", (req, res) => {
-  const redirectUri = (req.body.redirect_uri as string | undefined) ?? "";
-  const state = (req.body.state as string | undefined) ?? "";
-  if (!redirectUri) return res.status(400).send("Missing redirect_uri");
-  const u = new URL(redirectUri);
-  u.searchParams.set("error", "access_denied");
-  if (state) u.searchParams.set("state", state);
-  res.redirect(u.toString());
-});
-
-app.post("/oauth/approve", (req, res) => {
-  const clientId = (req.body.client_id as string | undefined) ?? "";
-  const redirectUri = (req.body.redirect_uri as string | undefined) ?? "";
-  const state = (req.body.state as string | undefined) ?? "";
-  const scope = (req.body.scope as string | undefined) ?? "github.read";
-  const codeChallenge = (req.body.code_challenge as string | undefined) ?? "";
-  const codeChallengeMethod = (req.body.code_challenge_method as string | undefined) ?? "S256";
-
-  if (!clientId || !redirectUri || !codeChallenge) {
-    return res.status(400).send("Missing OAuth params.");
-  }
-  if (!isAllowedRedirectUri(redirectUri)) {
-    return res.status(400).send("redirect_uri not allowed.");
-  }
-
-  const connected = requireConnectedUser(req);
-  if (!connected) {
-    return res.status(400).send("Not connected. Go to /connect first.");
-  }
-
-  const code = `c_${randomToken(24)}`;
-  const expiresAt = nowMs() + 5 * 60 * 1000; // 5 minutes
-
-  db.prepare(
-    `INSERT INTO oauth_codes (code, clientId, userId, redirectUri, scope, codeChallenge, codeChallengeMethod, expiresAt)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
-  ).run(code, clientId, connected.userId, redirectUri, scope, codeChallenge, codeChallengeMethod, expiresAt);
-
-  const u = new URL(redirectUri);
-  u.searchParams.set("code", code);
-  if (state) u.searchParams.set("state", state);
-  res.redirect(u.toString());
-});
-
-/**
- * === OAuth token ===
- * Supports:
- * - authorization_code with PKCE verifier
- * - refresh_token
- *
- * Token endpoint auth method: none OR client_secret_post (optional).
- */
-app.post("/oauth/token", (req, res) => {
-  const grantType = (req.body.grant_type as string | undefined) ?? "";
-  const clientId = (req.body.client_id as string | undefined) ?? "";
-  const clientSecret = (req.body.client_secret as string | undefined) ?? ""; // optional
-  const code = (req.body.code as string | undefined) ?? "";
-  const redirectUri = (req.body.redirect_uri as string | undefined) ?? "";
-  const codeVerifier = (req.body.code_verifier as string | undefined) ?? "";
-  const refreshToken = (req.body.refresh_token as string | undefined) ?? "";
-
-  if (!clientId) return res.status(400).json({ error: "invalid_request" });
-
-  // We currently allow public clients (no secret) — which is what ChatGPT typically uses with PKCE.
-  // If you want to lock this down later, add an allowlist of client_ids here.
-
-  if (grantType === "authorization_code") {
-    if (!code || !redirectUri || !codeVerifier) {
-      return res.status(400).json({ error: "invalid_request" });
-    }
-
-    const row = db.prepare("SELECT * FROM oauth_codes WHERE code = ?").get(code) as any;
-    if (!row) return res.status(400).json({ error: "invalid_grant" });
-    if (row.clientId !== clientId) return res.status(400).json({ error: "invalid_grant" });
-    if (row.redirectUri !== redirectUri) return res.status(400).json({ error: "invalid_grant" });
-    if (nowMs() > row.expiresAt) return res.status(400).json({ error: "invalid_grant" });
-
-    // PKCE check
-    let expected = "";
-    if (row.codeChallengeMethod === "plain") expected = codeVerifier;
-    else expected = sha256Base64Url(codeVerifier);
-
-    if (expected !== row.codeChallenge) return res.status(400).json({ error: "invalid_grant" });
-
-    // One-time use
-    db.prepare("DELETE FROM oauth_codes WHERE code = ?").run(code);
-
-    const accessToken = `at_${randomToken(32)}`;
-    const refresh = `rt_${randomToken(32)}`;
-
-    const accessHash = sha256Base64Url(accessToken);
-    const refreshHash = sha256Base64Url(refresh);
-
-    const accessExpiresAt = nowMs() + 60 * 60 * 1000; // 1 hour
-    const refreshExpiresAt = nowMs() + 30 * 24 * 60 * 60 * 1000; // 30 days
-
-    db.prepare(
-      `INSERT INTO oauth_tokens (accessTokenHash, refreshTokenHash, clientId, userId, scope, accessExpiresAt, refreshExpiresAt, createdAt)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
-    ).run(accessHash, refreshHash, clientId, row.userId, row.scope, accessExpiresAt, refreshExpiresAt, nowMs());
-
-    return res.json({
-      token_type: "Bearer",
-      access_token: accessToken,
-      refresh_token: refresh,
-      expires_in: 3600,
-      scope: row.scope,
-    });
-  }
-
-  if (grantType === "refresh_token") {
-    if (!refreshToken) return res.status(400).json({ error: "invalid_request" });
-
-    const refreshHash = sha256Base64Url(refreshToken);
-    const row = db.prepare("SELECT * FROM oauth_tokens WHERE refreshTokenHash = ?").get(refreshHash) as any;
-    if (!row) return res.status(400).json({ error: "invalid_grant" });
-    if (row.clientId !== clientId) return res.status(400).json({ error: "invalid_grant" });
-    if (nowMs() > row.refreshExpiresAt) return res.status(400).json({ error: "invalid_grant" });
-
-    // Rotate tokens
-    db.prepare("DELETE FROM oauth_tokens WHERE refreshTokenHash = ?").run(refreshHash);
-
-    const accessToken = `at_${randomToken(32)}`;
-    const refresh = `rt_${randomToken(32)}`;
-
-    const accessHash = sha256Base64Url(accessToken);
-    const newRefreshHash = sha256Base64Url(refresh);
-
-    const accessExpiresAt = nowMs() + 60 * 60 * 1000;
-    const refreshExpiresAt = nowMs() + 30 * 24 * 60 * 60 * 1000;
-
-    db.prepare(
-      `INSERT INTO oauth_tokens (accessTokenHash, refreshTokenHash, clientId, userId, scope, accessExpiresAt, refreshExpiresAt, createdAt)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
-    ).run(accessHash, newRefreshHash, clientId, row.userId, row.scope, accessExpiresAt, refreshExpiresAt, nowMs());
-
-    return res.json({
-      token_type: "Bearer",
-      access_token: accessToken,
-      refresh_token: refresh,
-      expires_in: 3600,
-      scope: row.scope,
-    });
-  }
-
-  return res.status(400).json({ error: "unsupported_grant_type" });
-});
-
-app.post("/oauth/revoke", (req, res) => {
-  const token = (req.body.token as string | undefined) ?? "";
-  if (!token) return res.status(200).send(""); // per RFC, revocation is best-effort
-
-  const hash = sha256Base64Url(token);
-  db.prepare("DELETE FROM oauth_tokens WHERE accessTokenHash = ? OR refreshTokenHash = ?").run(hash, hash);
-  res.status(200).send("");
-});
-
-/**
- * === MCP ===
- * Minimal MCP-ish JSON-RPC handling:
- * - tools/list
- * - tools/call
- *
- * Authorization: Bearer <access_token>
- */
 type McpRequest = {
   jsonrpc?: string;
   id?: string | number | null;
@@ -616,24 +235,14 @@ function requireBearer(req: any) {
   return m?.[1] ?? null;
 }
 
-function getTokenRow(accessToken: string) {
-  const hash = sha256Base64Url(accessToken);
-  const row = db.prepare("SELECT * FROM oauth_tokens WHERE accessTokenHash = ?").get(hash) as any;
-  if (!row) return null;
-  if (nowMs() > row.accessExpiresAt) return null;
-  return row;
-}
-
 function hasScope(scopeStr: string, needed: "github.read" | "github.write") {
   const scopes = scopeStr.split(/\s+/).filter(Boolean);
   if (needed === "github.read") return scopes.includes("github.read") || scopes.includes("github.write");
   return scopes.includes("github.write");
 }
 
-async function githubFetch(userId: string, url: string, init?: RequestInit) {
-  const secret = db.prepare("SELECT githubTokenEnc FROM user_secrets WHERE userId = ?").get(userId) as
-    | { githubTokenEnc: string }
-    | undefined;
+async function githubFetch(store: StoreShape, userId: string, url: string, init?: RequestInit) {
+  const secret = store.userSecrets[userId];
   if (!secret?.githubTokenEnc) throw new Error("No GitHub token connected. Visit /connect");
 
   const pat = decryptString(secret.githubTokenEnc);
@@ -740,167 +349,598 @@ const tools = [
   },
 ];
 
-app.post("/mcp", async (req, res) => {
-  const bearer = requireBearer(req);
-  if (!bearer) return res.status(401).json(jsonRpcError(req.body?.id, 401, "Missing Bearer token"));
+/**
+ * IMPORTANT: index.ts expects this named export.
+ */
+export function getServer() {
+  const store = loadStore();
 
-  const tokenRow = getTokenRow(bearer);
-  if (!tokenRow) return res.status(401).json(jsonRpcError(req.body?.id, 401, "Invalid or expired token"));
+  const app = express();
 
-  const userId = tokenRow.userId as string;
-  const scope = tokenRow.scope as string;
+  app.use(express.json({ limit: "2mb" }));
+  app.use(express.urlencoded({ extended: true }));
 
-  const body = req.body as McpRequest;
-  const id = body?.id ?? null;
+  function ensureUser(userId: string) {
+    if (!store.users[userId]) {
+      store.users[userId] = { id: userId, createdAt: nowMs() };
+      saveStore(store);
+    }
+  }
 
-  try {
-    if (!body || !body.method) {
-      return res.status(400).json(jsonRpcError(id, 400, "Invalid request"));
+  function requireConnectedUser(req: any) {
+    const userId = getSessionUserId(req);
+    if (!userId) return null;
+    ensureUser(userId);
+    const secret = store.userSecrets[userId];
+    if (!secret?.githubTokenEnc) return null;
+    return { userId, githubTokenEnc: secret.githubTokenEnc };
+  }
+
+  /**
+   * === Public well-known docs for ChatGPT ===
+   */
+  app.get("/.well-known/oauth-protected-resource", (_req, res) => {
+    res.json({
+      resource: BASE_URL,
+      authorization_servers: [`${BASE_URL}/.well-known/oauth-authorization-server`],
+    });
+  });
+
+  app.get("/.well-known/oauth-authorization-server", (_req, res) => {
+    res.json({
+      issuer: BASE_URL,
+      authorization_endpoint: `${BASE_URL}/oauth/authorize`,
+      token_endpoint: `${BASE_URL}/oauth/token`,
+      revocation_endpoint: `${BASE_URL}/oauth/revoke`,
+      response_types_supported: ["code"],
+      grant_types_supported: ["authorization_code", "refresh_token"],
+      code_challenge_methods_supported: ["S256", "plain"],
+      token_endpoint_auth_methods_supported: ["none", "client_secret_post"],
+      scopes_supported: ["github.read", "github.write"],
+    });
+  });
+
+  /**
+   * === Connect screen ===
+   */
+  app.get("/connect", (req, res) => {
+    const returnTo = (req.query.returnTo as string | undefined) ?? "/";
+    const userId = getSessionUserId(req);
+    const ok = req.query.ok === "1";
+
+    res.setHeader("Content-Type", "text/html; charset=utf-8");
+    res.send(`
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>${APP_NAME} – Connect</title>
+  <style>
+    body { font-family: system-ui, -apple-system, Segoe UI, Roboto, sans-serif; margin: 0; padding: 24px; background:#0b0b0c; color:#fff; }
+    .card { max-width: 720px; margin: 0 auto; background:#141416; border:1px solid #2a2a2f; border-radius: 14px; padding: 18px; }
+    a { color: #8ab4ff; }
+    input { width:100%; padding:12px; border-radius: 10px; border:1px solid #2a2a2f; background:#0f0f12; color:#fff; }
+    button { padding: 12px 14px; border-radius: 10px; border: 0; background: #2b6cff; color:#fff; font-weight: 600; cursor:pointer; }
+    .muted { color:#b7b7c2; font-size: 14px; line-height: 1.4; }
+    .ok { background:#0f2a16; border:1px solid #1f7a3a; padding:10px 12px; border-radius: 10px; margin-bottom: 12px; }
+    .warn { background:#2a1a0f; border:1px solid #a85a1a; padding:10px 12px; border-radius: 10px; margin-top: 12px; }
+    code { background:#0f0f12; padding: 2px 6px; border-radius: 6px; }
+  </style>
+</head>
+<body>
+  <div class="card">
+    <h2>${APP_NAME}: Connect GitHub</h2>
+    <p class="muted">
+      Paste a <strong>GitHub Personal Access Token</strong>.
+      It is stored <strong>encrypted</strong> and used only after you approve access.
+    </p>
+
+    ${ok ? `<div class="ok">Saved. You can go back to ChatGPT and continue connecting.</div>` : ""}
+
+    <form method="POST" action="/connect">
+      <input type="hidden" name="returnTo" value="${encodeURIComponent(returnTo)}" />
+      <label class="muted">GitHub Personal Access Token</label>
+      <input name="githubToken" placeholder="ghp_..." autocomplete="off" />
+      <div style="height: 12px"></div>
+      <button type="submit">Save token</button>
+    </form>
+
+    <div class="warn">
+      <div class="muted">
+        Tip: Use the minimum scopes you need.
+        Private repos usually need <code>repo</code>. Public-only may use <code>public_repo</code>.
+      </div>
+    </div>
+
+    <div style="height: 10px"></div>
+    <p class="muted">Session: ${userId ? `<code>${userId}</code>` : "not set yet"}</p>
+  </div>
+</body>
+</html>
+    `);
+  });
+
+  app.post("/connect", (req, res) => {
+    const githubToken = (req.body.githubToken as string | undefined)?.trim() ?? "";
+    const returnToEnc = (req.body.returnTo as string | undefined) ?? "%2F";
+    const returnTo = decodeURIComponent(returnToEnc);
+
+    if (!githubToken || githubToken.length < 20) {
+      return res.status(400).send("Token missing or too short.");
     }
 
-    if (body.method === "tools/list") {
-      return res.json(
-        jsonRpcResult(id, {
-          tools: tools.map((t) => ({
-            name: t.name,
-            description: t.description,
-            inputSchema: t.inputSchema,
-          })),
-        }),
-      );
+    const userId = getSessionUserId(req) ?? `u_${randomToken(12)}`;
+    ensureUser(userId);
+
+    const enc = encryptString(githubToken);
+
+    store.userSecrets[userId] = {
+      userId,
+      githubTokenEnc: enc,
+      updatedAt: nowMs(),
+    };
+
+    saveStore(store);
+    setCookie(res, "mcp_session", signCookie({ userId }));
+    res.redirect(`/connect?ok=1&returnTo=${encodeURIComponent(returnTo)}`);
+  });
+
+  /**
+   * === OAuth authorize ===
+   */
+  app.get("/oauth/authorize", (req, res) => {
+    const clientId = (req.query.client_id as string | undefined) ?? "";
+    const redirectUri = (req.query.redirect_uri as string | undefined) ?? "";
+    const responseType = (req.query.response_type as string | undefined) ?? "";
+    const state = (req.query.state as string | undefined) ?? "";
+    const scope = (req.query.scope as string | undefined) ?? "github.read";
+    const codeChallenge = (req.query.code_challenge as string | undefined) ?? "";
+    const codeChallengeMethod = ((req.query.code_challenge_method as string | undefined) ?? "S256") as
+      | "S256"
+      | "plain";
+
+    if (!clientId || !redirectUri || responseType !== "code") {
+      return res.status(400).send("Missing required OAuth parameters.");
+    }
+    if (!isAllowedRedirectUri(redirectUri)) {
+      return res.status(400).send("redirect_uri not allowed.");
+    }
+    if (!codeChallenge || !["S256", "plain"].includes(codeChallengeMethod)) {
+      return res.status(400).send("PKCE code_challenge is required (S256 or plain).");
     }
 
-    if (body.method === "tools/call") {
-      const toolName = body.params?.name as string | undefined;
-      const args = body.params?.arguments ?? {};
+    const ts = nowMs();
+    const existingClient = store.oauthClients[clientId];
+    const redirectUris = new Set<string>(existingClient?.redirectUris ?? []);
+    redirectUris.add(redirectUri);
 
-      const tool = tools.find((t) => t.name === toolName);
-      if (!tool) return res.status(404).json(jsonRpcError(id, 404, "Tool not found"));
+    store.oauthClients[clientId] = {
+      clientId,
+      redirectUris: [...redirectUris],
+      createdAt: existingClient?.createdAt ?? ts,
+      updatedAt: ts,
+    };
+    saveStore(store);
 
-      // Scope enforcement
-      if (tool.requiredScope === "github.write" && !hasScope(scope, "github.write")) {
-        return res.status(403).json(jsonRpcError(id, 403, "Missing scope github.write"));
+    const connected = requireConnectedUser(req);
+    if (!connected) {
+      const fullReturn = `${BASE_URL}/oauth/authorize?${new URLSearchParams(req.query as any).toString()}`;
+      return res.redirect(`/connect?returnTo=${encodeURIComponent(fullReturn)}`);
+    }
+
+    const scopes = scope.split(/\s+/).filter(Boolean);
+    res.setHeader("Content-Type", "text/html; charset=utf-8");
+    res.send(`
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>${APP_NAME} – Approve</title>
+  <style>
+    body { font-family: system-ui, -apple-system, Segoe UI, Roboto, sans-serif; margin: 0; padding: 24px; background:#0b0b0c; color:#fff; }
+    .card { max-width: 720px; margin: 0 auto; background:#141416; border:1px solid #2a2a2f; border-radius: 14px; padding: 18px; }
+    .muted { color:#b7b7c2; font-size: 14px; line-height: 1.4; }
+    .row { display:flex; gap:12px; margin-top: 14px; }
+    button { flex:1; padding: 12px 14px; border-radius: 10px; border: 0; font-weight: 700; cursor:pointer; }
+    .approve { background: #2b6cff; color:#fff; }
+    .deny { background: #2a2a2f; color:#fff; }
+    ul { margin: 8px 0 0 18px; }
+    code { background:#0f0f12; padding: 2px 6px; border-radius: 6px; }
+  </style>
+</head>
+<body>
+  <div class="card">
+    <h2>Allow ChatGPT to access GitHub?</h2>
+    <p class="muted">
+      You are approving access from <code>${clientId}</code> via ${APP_NAME}.
+    </p>
+
+    <div class="muted" style="margin-top:10px;">
+      Requested permissions:
+      <ul>
+        ${scopes.map((s) => `<li><code>${s}</code></li>`).join("")}
+      </ul>
+    </div>
+
+    <div class="row">
+      <form method="POST" action="/oauth/approve" style="flex:1">
+        ${["client_id","redirect_uri","response_type","state","scope","code_challenge","code_challenge_method"]
+          .map((k) => `<input type="hidden" name="${k}" value="${String((req.query as any)[k] ?? "")}" />`)
+          .join("")}
+        <button class="approve" type="submit">Approve</button>
+      </form>
+
+      <form method="POST" action="/oauth/deny" style="flex:1">
+        ${["redirect_uri","state"].map((k) => `<input type="hidden" name="${k}" value="${String((req.query as any)[k] ?? "")}" />`).join("")}
+        <button class="deny" type="submit">Deny</button>
+      </form>
+    </div>
+
+    <p class="muted" style="margin-top:12px;">
+      Tip: If you need write actions (create issues), request <code>github.write</code>.
+    </p>
+  </div>
+</body>
+</html>
+    `);
+  });
+
+  app.post("/oauth/deny", (req, res) => {
+    const redirectUri = (req.body.redirect_uri as string | undefined) ?? "";
+    const state = (req.body.state as string | undefined) ?? "";
+    if (!redirectUri) return res.status(400).send("Missing redirect_uri");
+    const u = new URL(redirectUri);
+    u.searchParams.set("error", "access_denied");
+    if (state) u.searchParams.set("state", state);
+    res.redirect(u.toString());
+  });
+
+  app.post("/oauth/approve", (req, res) => {
+    const clientId = (req.body.client_id as string | undefined) ?? "";
+    const redirectUri = (req.body.redirect_uri as string | undefined) ?? "";
+    const state = (req.body.state as string | undefined) ?? "";
+    const scope = (req.body.scope as string | undefined) ?? "github.read";
+    const codeChallenge = (req.body.code_challenge as string | undefined) ?? "";
+    const codeChallengeMethod = ((req.body.code_challenge_method as string | undefined) ?? "S256") as
+      | "S256"
+      | "plain";
+
+    if (!clientId || !redirectUri || !codeChallenge) {
+      return res.status(400).send("Missing OAuth params.");
+    }
+    if (!isAllowedRedirectUri(redirectUri)) {
+      return res.status(400).send("redirect_uri not allowed.");
+    }
+
+    const connected = requireConnectedUser(req);
+    if (!connected) {
+      return res.status(400).send("Not connected. Go to /connect first.");
+    }
+
+    const code = `c_${randomToken(24)}`;
+    const expiresAt = nowMs() + 5 * 60 * 1000;
+
+    store.oauthCodes[code] = {
+      code,
+      clientId,
+      userId: connected.userId,
+      redirectUri,
+      scope,
+      codeChallenge,
+      codeChallengeMethod,
+      expiresAt,
+    };
+    saveStore(store);
+
+    const u = new URL(redirectUri);
+    u.searchParams.set("code", code);
+    if (state) u.searchParams.set("state", state);
+    res.redirect(u.toString());
+  });
+
+  /**
+   * === OAuth token ===
+   */
+  app.post("/oauth/token", (req, res) => {
+    const grantType = (req.body.grant_type as string | undefined) ?? "";
+    const clientId = (req.body.client_id as string | undefined) ?? "";
+    const code = (req.body.code as string | undefined) ?? "";
+    const redirectUri = (req.body.redirect_uri as string | undefined) ?? "";
+    const codeVerifier = (req.body.code_verifier as string | undefined) ?? "";
+    const refreshToken = (req.body.refresh_token as string | undefined) ?? "";
+
+    if (!clientId) return res.status(400).json({ error: "invalid_request" });
+
+    if (grantType === "authorization_code") {
+      if (!code || !redirectUri || !codeVerifier) {
+        return res.status(400).json({ error: "invalid_request" });
       }
-      if (tool.requiredScope === "github.read" && !hasScope(scope, "github.read")) {
-        return res.status(403).json(jsonRpcError(id, 403, "Missing scope github.read"));
+
+      const row = store.oauthCodes[code];
+      if (!row) return res.status(400).json({ error: "invalid_grant" });
+      if (row.clientId !== clientId) return res.status(400).json({ error: "invalid_grant" });
+      if (row.redirectUri !== redirectUri) return res.status(400).json({ error: "invalid_grant" });
+      if (nowMs() > row.expiresAt) return res.status(400).json({ error: "invalid_grant" });
+
+      let expected = "";
+      if (row.codeChallengeMethod === "plain") expected = codeVerifier;
+      else expected = sha256Base64Url(codeVerifier);
+
+      if (expected !== row.codeChallenge) return res.status(400).json({ error: "invalid_grant" });
+
+      delete store.oauthCodes[code];
+
+      const accessToken = `at_${randomToken(32)}`;
+      const refresh = `rt_${randomToken(32)}`;
+
+      const accessHash = sha256Base64Url(accessToken);
+      const refreshHash = sha256Base64Url(refresh);
+
+      const accessExpiresAt = nowMs() + 60 * 60 * 1000;
+      const refreshExpiresAt = nowMs() + 30 * 24 * 60 * 60 * 1000;
+
+      const tokenRow: OAuthTokenRow = {
+        accessTokenHash: accessHash,
+        refreshTokenHash: refreshHash,
+        clientId,
+        userId: row.userId,
+        scope: row.scope,
+        accessExpiresAt,
+        refreshExpiresAt,
+        createdAt: nowMs(),
+      };
+
+      store.oauthTokensByAccessHash[accessHash] = tokenRow;
+      store.oauthTokensByRefreshHash[refreshHash] = tokenRow;
+      saveStore(store);
+
+      return res.json({
+        token_type: "Bearer",
+        access_token: accessToken,
+        refresh_token: refresh,
+        expires_in: 3600,
+        scope: row.scope,
+      });
+    }
+
+    if (grantType === "refresh_token") {
+      if (!refreshToken) return res.status(400).json({ error: "invalid_request" });
+
+      const refreshHash = sha256Base64Url(refreshToken);
+      const row = store.oauthTokensByRefreshHash[refreshHash];
+      if (!row) return res.status(400).json({ error: "invalid_grant" });
+      if (row.clientId !== clientId) return res.status(400).json({ error: "invalid_grant" });
+      if (nowMs() > row.refreshExpiresAt) return res.status(400).json({ error: "invalid_grant" });
+
+      delete store.oauthTokensByRefreshHash[refreshHash];
+      delete store.oauthTokensByAccessHash[row.accessTokenHash];
+
+      const accessToken = `at_${randomToken(32)}`;
+      const refresh = `rt_${randomToken(32)}`;
+
+      const accessHash = sha256Base64Url(accessToken);
+      const newRefreshHash = sha256Base64Url(refresh);
+
+      const accessExpiresAt = nowMs() + 60 * 60 * 1000;
+      const refreshExpiresAt = nowMs() + 30 * 24 * 60 * 60 * 1000;
+
+      const newRow: OAuthTokenRow = {
+        accessTokenHash: accessHash,
+        refreshTokenHash: newRefreshHash,
+        clientId,
+        userId: row.userId,
+        scope: row.scope,
+        accessExpiresAt,
+        refreshExpiresAt,
+        createdAt: nowMs(),
+      };
+
+      store.oauthTokensByAccessHash[accessHash] = newRow;
+      store.oauthTokensByRefreshHash[newRefreshHash] = newRow;
+      saveStore(store);
+
+      return res.json({
+        token_type: "Bearer",
+        access_token: accessToken,
+        refresh_token: refresh,
+        expires_in: 3600,
+        scope: row.scope,
+      });
+    }
+
+    return res.status(400).json({ error: "unsupported_grant_type" });
+  });
+
+  app.post("/oauth/revoke", (req, res) => {
+    const token = (req.body.token as string | undefined) ?? "";
+    if (!token) return res.status(200).send("");
+
+    const hash = sha256Base64Url(token);
+
+    const byAccess = store.oauthTokensByAccessHash[hash];
+    if (byAccess) {
+      delete store.oauthTokensByAccessHash[byAccess.accessTokenHash];
+      delete store.oauthTokensByRefreshHash[byAccess.refreshTokenHash];
+      saveStore(store);
+      return res.status(200).send("");
+    }
+
+    const byRefresh = store.oauthTokensByRefreshHash[hash];
+    if (byRefresh) {
+      delete store.oauthTokensByAccessHash[byRefresh.accessTokenHash];
+      delete store.oauthTokensByRefreshHash[byRefresh.refreshTokenHash];
+      saveStore(store);
+      return res.status(200).send("");
+    }
+
+    res.status(200).send("");
+  });
+
+  function getTokenRow(accessToken: string) {
+    const hash = sha256Base64Url(accessToken);
+    const row = store.oauthTokensByAccessHash[hash];
+    if (!row) return null;
+    if (nowMs() > row.accessExpiresAt) return null;
+    return row;
+  }
+
+  /**
+   * === MCP endpoint ===
+   */
+  app.post("/mcp", async (req, res) => {
+    const bearer = requireBearer(req);
+    if (!bearer) return res.status(401).json(jsonRpcError(req.body?.id, 401, "Missing Bearer token"));
+
+    const tokenRow = getTokenRow(bearer);
+    if (!tokenRow) return res.status(401).json(jsonRpcError(req.body?.id, 401, "Invalid or expired token"));
+
+    const userId = tokenRow.userId as string;
+    const scope = tokenRow.scope as string;
+
+    const body = req.body as McpRequest;
+    const id = body?.id ?? null;
+
+    try {
+      if (!body || !body.method) {
+        return res.status(400).json(jsonRpcError(id, 400, "Invalid request"));
       }
 
-      // Execute tool
-      let result: any = null;
+      if (body.method === "tools/list") {
+        return res.json(
+          jsonRpcResult(id, {
+            tools: tools.map((t) => ({
+              name: t.name,
+              description: t.description,
+              inputSchema: t.inputSchema,
+            })),
+          }),
+        );
+      }
 
-      if (toolName === "github.search_repositories") {
-        const q = String(args.query ?? "");
-        const perPage = Math.max(1, Math.min(50, Number(args.perPage ?? 10)));
-        result = await githubFetch(
-          userId,
-          `https://api.github.com/search/repositories?q=${encodeURIComponent(q)}&per_page=${perPage}`,
-        );
-      } else if (toolName === "github.list_repo_issues") {
-        const owner = String(args.owner ?? "");
-        const repo = String(args.repo ?? "");
-        const state = String(args.state ?? "open");
-        const perPage = Math.max(1, Math.min(50, Number(args.perPage ?? 20)));
-        result = await githubFetch(
-          userId,
-          `https://api.github.com/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}/issues?state=${encodeURIComponent(
-            state,
-          )}&per_page=${perPage}`,
-        );
-      } else if (toolName === "github.list_repo_prs") {
-        const owner = String(args.owner ?? "");
-        const repo = String(args.repo ?? "");
-        const state = String(args.state ?? "open");
-        const perPage = Math.max(1, Math.min(50, Number(args.perPage ?? 20)));
-        result = await githubFetch(
-          userId,
-          `https://api.github.com/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}/pulls?state=${encodeURIComponent(
-            state,
-          )}&per_page=${perPage}`,
-        );
-      } else if (toolName === "github.get_file") {
-        const owner = String(args.owner ?? "");
-        const repo = String(args.repo ?? "");
-        const filePath = String(args.path ?? "");
-        const ref = args.ref ? `?ref=${encodeURIComponent(String(args.ref))}` : "";
-        const json = await githubFetch(
-          userId,
-          `https://api.github.com/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}/contents/${encodeURIComponent(
-            filePath,
-          )}${ref}`,
-        );
-        // GitHub returns { content: base64, encoding: 'base64' }
-        if (json?.content && json?.encoding === "base64") {
-          const decoded = Buffer.from(String(json.content).replace(/\n/g, ""), "base64").toString("utf8");
-          result = { ...json, decodedText: decoded };
-        } else {
-          result = json;
+      if (body.method === "tools/call") {
+        const toolName = body.params?.name as string | undefined;
+        const args = body.params?.arguments ?? {};
+
+        const tool = tools.find((t) => t.name === toolName);
+        if (!tool) return res.status(404).json(jsonRpcError(id, 404, "Tool not found"));
+
+        if (tool.requiredScope === "github.write" && !hasScope(scope, "github.write")) {
+          return res.status(403).json(jsonRpcError(id, 403, "Missing scope github.write"));
         }
-      } else if (toolName === "github.create_issue") {
-        const owner = String(args.owner ?? "");
-        const repo = String(args.repo ?? "");
-        const title = String(args.title ?? "");
-        const bodyText = args.body ? String(args.body) : undefined;
-        const labels = Array.isArray(args.labels) ? args.labels.map(String) : undefined;
+        if (tool.requiredScope === "github.read" && !hasScope(scope, "github.read")) {
+          return res.status(403).json(jsonRpcError(id, 403, "Missing scope github.read"));
+        }
 
-        result = await githubFetch(
-          userId,
-          `https://api.github.com/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}/issues`,
-          {
+        let result: any = null;
+
+        if (toolName === "github.search_repositories") {
+          const q = String(args.query ?? "");
+          const perPage = Math.max(1, Math.min(50, Number(args.perPage ?? 10)));
+          result = await githubFetch(
+            store,
+            userId,
+            `https://api.github.com/search/repositories?q=${encodeURIComponent(q)}&per_page=${perPage}`,
+          );
+        } else if (toolName === "github.list_repo_issues") {
+          const owner = String(args.owner ?? "");
+          const repo = String(args.repo ?? "");
+          const state = String(args.state ?? "open");
+          const perPage = Math.max(1, Math.min(50, Number(args.perPage ?? 20)));
+          result = await githubFetch(
+            store,
+            userId,
+            `https://api.github.com/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}/issues?state=${encodeURIComponent(
+              state,
+            )}&per_page=${perPage}`,
+          );
+        } else if (toolName === "github.list_repo_prs") {
+          const owner = String(args.owner ?? "");
+          const repo = String(args.repo ?? "");
+          const state = String(args.state ?? "open");
+          const perPage = Math.max(1, Math.min(50, Number(args.perPage ?? 20)));
+          result = await githubFetch(
+            store,
+            userId,
+            `https://api.github.com/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}/pulls?state=${encodeURIComponent(
+              state,
+            )}&per_page=${perPage}`,
+          );
+        } else if (toolName === "github.get_file") {
+          const owner = String(args.owner ?? "");
+          const repo = String(args.repo ?? "");
+          const filePath = String(args.path ?? "");
+          const ref = args.ref ? `?ref=${encodeURIComponent(String(args.ref))}` : "";
+          const json = await githubFetch(
+            store,
+            userId,
+            `https://api.github.com/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}/contents/${encodeURIComponent(
+              filePath,
+            )}${ref}`,
+          );
+          if (json?.content && json?.encoding === "base64") {
+            const decoded = Buffer.from(String(json.content).replace(/\n/g, ""), "base64").toString("utf8");
+            result = { ...json, decodedText: decoded };
+          } else {
+            result = json;
+          }
+        } else if (toolName === "github.create_issue") {
+          const owner = String(args.owner ?? "");
+          const repo = String(args.repo ?? "");
+          const title = String(args.title ?? "");
+          const bodyText = args.body ? String(args.body) : undefined;
+          const labels = Array.isArray(args.labels) ? args.labels.map(String) : undefined;
+
+          result = await githubFetch(store, userId, `https://api.github.com/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}/issues`, {
             method: "POST",
             headers: { "Content-Type": "application/json" },
             body: JSON.stringify({ title, body: bodyText, labels }),
-          },
+          });
+        } else {
+          return res.status(400).json(jsonRpcError(id, 400, "Tool not implemented"));
+        }
+
+        return res.json(
+          jsonRpcResult(id, {
+            content: [{ type: "text", text: JSON.stringify(result, null, 2) }],
+          }),
         );
-      } else {
-        return res.status(400).json(jsonRpcError(id, 400, "Tool not implemented"));
       }
 
-      return res.json(
-        jsonRpcResult(id, {
-          content: [{ type: "text", text: JSON.stringify(result, null, 2) }],
-        }),
-      );
+      if (body.method === "initialize") {
+        return res.json(
+          jsonRpcResult(id, {
+            name: APP_NAME,
+            version: "1.0.0",
+            capabilities: { tools: {} },
+          }),
+        );
+      }
+
+      return res.status(404).json(jsonRpcError(id, 404, "Method not found"));
+    } catch (e: any) {
+      return res.status(500).json(jsonRpcError(id, 500, e?.message ?? "Server error"));
     }
+  });
 
-    // Basic handshake methods some clients send
-    if (body.method === "initialize") {
-      return res.json(
-        jsonRpcResult(id, {
-          name: APP_NAME,
-          version: "1.0.0",
-          capabilities: { tools: {} },
-        }),
-      );
-    }
+  app.get("/", (_req, res) => {
+    res.setHeader("Content-Type", "text/plain; charset=utf-8");
+    res.send(
+      [
+        `${APP_NAME} is running.`,
+        ``,
+        `Connect page: ${BASE_URL}/connect`,
+        `MCP endpoint: POST ${BASE_URL}/mcp`,
+        `OAuth metadata:`,
+        `- ${BASE_URL}/.well-known/oauth-protected-resource`,
+        `- ${BASE_URL}/.well-known/oauth-authorization-server`,
+      ].join("\n"),
+    );
+  });
 
-    return res.status(404).json(jsonRpcError(id, 404, "Method not found"));
-  } catch (e: any) {
-    return res.status(500).json(jsonRpcError(id, 500, e?.message ?? "Server error"));
-  }
-});
+  return app;
+}
 
-/**
- * Small homepage
- */
-app.get("/", (_req, res) => {
-  res.setHeader("Content-Type", "text/plain; charset=utf-8");
-  res.send(
-    [
-      `${APP_NAME} is running.`,
-      ``,
-      `Connect page: ${BASE_URL}/connect`,
-      `MCP endpoint: POST ${BASE_URL}/mcp`,
-      `OAuth metadata:`,
-      `- ${BASE_URL}/.well-known/oauth-protected-resource`,
-      `- ${BASE_URL}/.well-known/oauth-authorization-server`,
-    ].join("\n"),
-  );
-});
-
-const port = Number(process.env.PORT ?? 3000);
-app.listen(port, () => {
-  // eslint-disable-next-line no-console
-  console.log(`[server] ${APP_NAME} listening on port ${port}`);
-  // eslint-disable-next-line no-console
-  console.log(`[server] BASE_URL = ${BASE_URL}`);
-});
+// Optional default export (harmless, but convenient)
+export default getServer;

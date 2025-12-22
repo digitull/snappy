@@ -1,3 +1,17 @@
-import { startServer } from "./server";
+import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
+import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
+import { z } from "zod";
 
-startServer();
+const server = new McpServer({
+  name: "snappy",
+  version: "1.0.0",
+});
+
+// Minimal tool so transport detection + tools/list works
+server.tool("ping", { message: z.string().optional() }, async ({ message }) => {
+  return {
+    content: [{ type: "text", text: message ? `pong: ${message}` : "pong" }],
+  };
+});
+
+await server.connect(new StdioServerTransport());

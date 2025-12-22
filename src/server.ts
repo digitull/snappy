@@ -2,7 +2,7 @@ import express from "express";
 import cors from "cors";
 import { nanoid } from "nanoid";
 import { z } from "zod";
-import { MCP_API_KEY, PORT, REQUIRE_API_KEY } from "./config";
+import { MCP_API_KEY, PORT, REQUIRE_API_KEY } from "./config.js";
 
 type JsonRpcRequest = {
   jsonrpc?: "2.0";
@@ -123,7 +123,7 @@ export function startServer() {
   app.use(express.json({ limit: "2mb" }));
 
   // Health endpoint (NOT protected)
-  app.get("/", (_req, res) => {
+  app.get("/", (_req: express.Request, res: express.Response) => {
     res.json({
       ok: true,
       service: "snaptask-mcp-server",
@@ -134,7 +134,7 @@ export function startServer() {
   });
 
   // Protect ONLY /mcp and only when MCP_API_KEY is set
-  app.use("/mcp", (req, res, next) => {
+  app.use("/mcp", (req: express.Request, res: express.Response, next: express.NextFunction) => {
     if (!REQUIRE_API_KEY) return next();
     const token = String(req.header("x-api-key") || "").trim();
     if (!token || token !== MCP_API_KEY) {
@@ -146,7 +146,7 @@ export function startServer() {
   });
 
   // MCP JSON-RPC endpoint (POST only)
-  app.post("/mcp", async (req, res) => {
+  app.post("/mcp", async (req: express.Request, res: express.Response) => {
     const body = req.body as JsonRpcRequest;
 
     const id = body?.id ?? null;

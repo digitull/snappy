@@ -1,58 +1,22 @@
-import { Server } from "@modelcontextprotocol/sdk/server/index.js";
+import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { z } from "zod";
 
-const server = new Server(
-  {
-    name: "snappy",
-    version: "1.0.0",
-  },
-  {
-    capabilities: {
-      tools: {},
-    },
-  },
-);
-
-server.setRequestHandler("tools/list", async () => {
-  return {
-    tools: [
-      {
-        name: "ping",
-        description: "Health check tool (returns pong).",
-        inputSchema: {
-          type: "object",
-          properties: {},
-          additionalProperties: false,
-        },
-      },
-    ],
-  };
+const server = new McpServer({
+  name: "snappy",
+  version: "1.0.0",
 });
 
-server.setRequestHandler("tools/call", async (req: any) => {
-  const name = String(req?.params?.name ?? "");
-  const args = (req?.params?.arguments ?? {}) as unknown;
-
-  if (name === "ping") {
-    z.object({}).parse(args);
+// Minimal tool so transport detection + tools/list works
+server.tool(
+  "ping",
+  { message: z.string().optional() },
+  async (args) => {
+    const message = (args as any)?.message as string | undefined;
     return {
-      content: [{ type: "text", text: "pong" }],
+      content: [{ type: "text", text: message ? `pong: ${message}` : "pong" }],
     };
   }
+);
 
-  return {
-    content: [{ type: "text", text: `Unknown tool: ${name}` }],
-  };
-});
-
-async function main() {
-  const transport = new StdioServerTransport();
-  await server.connect(transport);
-}
-
-main().catch((err) => {
-  // eslint-disable-next-line no-console
-  console.error(err);
-  process.exit(1);
-});
+await server.connect(new StdioServerTransport());
